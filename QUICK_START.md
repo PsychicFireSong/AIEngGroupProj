@@ -42,7 +42,24 @@ Useful options:
 - Change `--weights` to `yolo11s.pt` or another checkpoint if you want a stronger starting point.
 - The training output is written under `runs/train/baseline` by default.
 
-## 4. Run inference
+## 4. Test the model
+
+The fastest way to test the model is to launch the Streamlit demo and run a few images through it.
+
+```powershell
+python -m streamlit run apps/inference_app.py
+```
+
+In the app, point the model path to the included `best.pt` file in the repository root, or to `runs/train/baseline/weights/best.pt` if you have trained a new checkpoint.
+
+Recommended test flow:
+
+- Upload a few sample images with visible defects.
+- Try a mixture of close-up and wide shots.
+- Compare the predicted class names against the expected defect type.
+- Adjust confidence and IoU in the sidebar if detections are too noisy or too strict.
+
+## 5. Run inference
 
 Start the Streamlit app from the repo root:
 
@@ -52,7 +69,7 @@ python -m streamlit run apps/inference_app.py
 
 The app will try to load `runs/train/baseline/weights/best.pt` automatically if it exists. If your trained weights live somewhere else, paste that path into the sidebar.
 
-## 5. What to check next
+## 6. What to check next
 
 - Confirm that `merged_dataset/data.yaml` was created.
 - Confirm that training produced `runs/train/baseline/weights/best.pt`.

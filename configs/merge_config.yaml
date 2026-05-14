@@ -1,0 +1,69 @@
+output_dir: merged_dataset
+seed: 42
+split:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+keep_empty: false
+
+classes:
+  - crack
+  - spalling
+  - corrosion
+  - pothole
+  - paint_degradation
+
+datasets:
+  - name: Finale.yolov11
+    path: Finale.yolov11
+  - name: Internal Wall Defect.yolov11
+    path: Internal Wall Defect.yolov11
+  - name: Concrete defect detection.yolov11
+    path: Concrete defect detection.yolov11
+  - name: Corrosion YOLOv8.yolov11
+    path: Corrosion YOLOv8.yolov11
+  - name: metal corrosion.yolov11
+    path: metal corrosion.yolov11
+  - name: Pothole detection YOLOv8.yolov11
+    path: Pothole detection YOLOv8.yolov11
+  - name: archive
+    path: archive
+
+synonyms:
+  crack:
+    - crack
+    - cracking
+    - 7-cracking
+    - 7_cr
+    - tile crack
+    - crazing
+  spalling:
+    - spalling
+    - spallingw
+    - spall
+    - 6-spalling
+    - exposed reinforcement
+    - exposed_reinforcement
+    - rebar
+    - scaling
+  corrosion:
+    - corrosion
+    - rust
+    - rust stain
+    - ruststrain
+    - 4-corrosion
+    - pitted surface
+    - rolled-in scale
+  pothole:
+    - pothole
+    - potholes
+  paint_degradation:
+    - peeling paint
+    - paint drips
+    - pin holes
+    - rough and patchy surface
+    - stain marks
+    - trowels marks
+    - patches
+    - scratches
+    - inclusion
