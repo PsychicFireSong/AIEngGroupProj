@@ -4,6 +4,21 @@ import json
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+MATERIALIZED_FILES = [
+    "configs/merge_config.yaml",
+    "configs/domain_sweep_manifest.csv",
+    "scripts/merge_datasets.py",
+    "scripts/extract_severity_crops.py",
+    "scripts/domain_sweep.py",
+    "scripts/auto_collect_domain_sources.py",
+    "scripts/build_domain_adaptation_dataset.py",
+    "scripts/build_severity_adaptation_dataset.py",
+    "apps/inference_api.py",
+]
+
+
 def source_lines(text: str) -> list[str]:
     text = text.strip() + "\n"
     return text.splitlines(keepends=True)
@@ -17,22 +32,63 @@ def code(text: str) -> dict:
     return {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": source_lines(text)}
 
 
+def materialize_project_cell() -> str:
+    contents = {path: (REPO_ROOT / path).read_text(encoding="utf-8") for path in MATERIALIZED_FILES}
+    return (
+        "PROJECT_FILE_CONTENTS = "
+        + repr(contents)
+        + r'''
+
+import py_compile
+
+
+def write_text_if_changed(path: Path, text: str) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return False
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+changed = []
+for relative_path, content in PROJECT_FILE_CONTENTS.items():
+    if write_text_if_changed(REPO_ROOT / relative_path, content):
+        changed.append(relative_path)
+
+if changed:
+    print("Notebook materialized these project files:")
+    for item in changed:
+        print(f"- {item}")
+else:
+    print("Project files already match the notebook copy.")
+
+for relative_path in PROJECT_FILE_CONTENTS:
+    if relative_path.endswith(".py"):
+        py_compile.compile(str(REPO_ROOT / relative_path), doraise=True)
+
+print("All materialized Python files compiled successfully.")
+mark_done("materialize_project_files", {"files": sorted(PROJECT_FILE_CONTENTS)})
+'''
+    )
+
+
 cells = [
     md(
         """
 # Two-Stage YOLO Defect Detection Pipeline
 
-Recoverable Google Colab workflow for the AI Engineering Group Project.
+## Cell 1: Environment, Drive, and Recovery Setup
 
-## Cell 1: Environment and Recovery Setup
+This is the compact 8-section Colab notebook. It keeps markdown and code separated, but each numbered section maps to one pipeline stage.
 
-- Mounts Google Drive and saves logs, weights, sweep reports, and pipeline state there.
-- Downloads or restores the seven baseline datasets automatically.
-- Builds split-safe Stage 1 detection data and Stage 2 severity crops.
-- Reuses the domain sweep we already produced when the CSVs exist.
-- Recollects target-domain facility/facade data and retrains only when the decision gate says it is useful.
+Recovery behavior:
 
-Before running dataset acquisition in Colab, add these values in the Colab Secrets panel or runtime environment:
+- Uses Google Drive for logs, weights, runs, cached datasets, sweep reports, and `pipeline_state.json`.
+- Recovers completed training from existing `best.pt` before trying to retrain.
+- Resumes interrupted training from `last.pt` only when training data is available.
+- Can run inference/sweeps from recovered weights even when raw baseline datasets are not needed in that session.
+
+Before running dataset download cells in Colab, add these in Colab Secrets or environment variables:
 
 - `ROBOFLOW_API_KEY`
 - `KAGGLE_USERNAME`
@@ -44,6 +100,7 @@ Before running dataset acquisition in Colab, add these values in the Colab Secre
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -60,25 +117,8 @@ try:
 except Exception as exc:
     print(f"Google Drive mount skipped or unavailable: {exc}")
 
-GITHUB_REPO_URL = ""          # Optional for fresh Colab: https://github.com/<owner>/AIEngGroupProj.git
-REPO_ROOT_OVERRIDE = ""       # Optional for fresh Colab: /content/AIEngGroupProj
-
-def get_secret(name: str, default: str = "") -> str:
-    value = os.environ.get(name, "")
-    if value:
-        return value
-    try:
-        from google.colab import userdata
-        value = userdata.get(name)
-        return value or default
-    except Exception:
-        return default
-
-
-# Credentials are read from Colab Secrets or environment variables, never committed to Git.
-ROBOFLOW_API_KEY = get_secret("ROBOFLOW_API_KEY")
-KAGGLE_USERNAME = get_secret("KAGGLE_USERNAME")
-KAGGLE_KEY = get_secret("KAGGLE_KEY")
+GITHUB_REPO_URL = ""     # Optional fresh Colab clone URL.
+REPO_ROOT_OVERRIDE = ""  # Optional existing path, for example: /content/AIEngGroupProj
 
 FORCE_DOWNLOAD_DATASETS = False
 FORCE_REBUILD_DATASETS = False
@@ -100,6 +140,23 @@ for path in (DRIVE_OUTPUT_ROOT, DRIVE_RUNS_ROOT, DRIVE_WEIGHTS_ROOT, LOG_ROOT):
     path.mkdir(parents=True, exist_ok=True)
 
 
+def get_secret(name: str, default: str = "") -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    try:
+        from google.colab import userdata
+        value = userdata.get(name)
+        return value or default
+    except Exception:
+        return default
+
+
+ROBOFLOW_API_KEY = get_secret("ROBOFLOW_API_KEY")
+KAGGLE_USERNAME = get_secret("KAGGLE_USERNAME")
+KAGGLE_KEY = get_secret("KAGGLE_KEY")
+
+
 def now_token() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -118,7 +175,7 @@ def redact_args(args: list[str]) -> list[str]:
 
 
 def run_process(args: list[str], cwd: Path | None = None, log_name: str = "command", env: dict | None = None) -> subprocess.CompletedProcess:
-    cwd = Path(cwd or REPO_ROOT)
+    cwd = Path(cwd or globals().get("REPO_ROOT", Path.cwd()))
     log_path = LOG_ROOT / f"{now_token()}_{log_name}.log"
     printable = " ".join(redact_args(args))
     print(f"Running: {printable}")
@@ -203,19 +260,59 @@ REPO_ROOT = ensure_repo_root()
 os.chdir(REPO_ROOT)
 WEIGHTS_DIR = REPO_ROOT / "weights"
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+DETECTOR_WEIGHT = DRIVE_WEIGHTS_ROOT / "defect_detector.pt"
+SEVERITY_WEIGHT = DRIVE_WEIGHTS_ROOT / "severity_cls.pt"
+DOMAIN_DETECTOR_WEIGHT = DRIVE_WEIGHTS_ROOT / "defect_detector_domain_adapted.pt"
+DOMAIN_SEVERITY_WEIGHT = DRIVE_WEIGHTS_ROOT / "severity_cls_domain_adapted.pt"
+
+
+def candidate_run_roots() -> list[Path]:
+    roots = [DRIVE_RUNS_ROOT, DRIVE_OUTPUT_ROOT / "runs", DRIVE_ROOT / "runs"]
+    return list(dict.fromkeys(path for path in roots if path.exists()))
+
+
+def checkpoint_candidates(kind: str, checkpoint_name: str = "best.pt") -> list[Path]:
+    final_candidates = []
+    if kind == "detector":
+        final_candidates = [DETECTOR_WEIGHT, DOMAIN_DETECTOR_WEIGHT, WEIGHTS_DIR / "defect_detector.pt", WEIGHTS_DIR / "defect_detector_domain_adapted.pt"]
+        include_terms, exclude_terms = ("stage1", "defect", "detector", "detect"), ("severity", "classify", "cls", "stage2")
+    else:
+        final_candidates = [SEVERITY_WEIGHT, DOMAIN_SEVERITY_WEIGHT, WEIGHTS_DIR / "severity_cls.pt", WEIGHTS_DIR / "severity_cls_domain_adapted.pt"]
+        include_terms, exclude_terms = ("severity", "classify", "cls", "stage2"), ("detector", "detect", "stage1")
+
+    candidates = [path for path in final_candidates if path.exists()]
+    for root in candidate_run_roots():
+        for path in root.glob(f"**/weights/{checkpoint_name}"):
+            lowered = str(path).replace("\\", "/").lower()
+            if any(term in lowered for term in include_terms) and not any(term in lowered for term in exclude_terms):
+                candidates.append(path)
+    candidates = [path.resolve() for path in candidates if path.exists()]
+    return sorted(set(candidates), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def previous_training_available() -> bool:
+    return bool(checkpoint_candidates("detector", "best.pt") and checkpoint_candidates("severity", "best.pt"))
+
+
+def copy_weight_to_local(drive_weight: Path, local_name: str) -> None:
+    if Path(drive_weight).exists():
+        target = WEIGHTS_DIR / local_name
+        shutil.copy2(drive_weight, target)
+        print(f"Local model ready: {target}")
+
+
 print(f"Working directory: {REPO_ROOT}")
 print(f"Drive output root: {DRIVE_OUTPUT_ROOT}")
-
-# Colab runtimes are ephemeral, so dependencies are installed each session.
 if (REPO_ROOT / "requirements.txt").exists():
     run_process([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"], log_name="pip_requirements")
 '''
     ),
     md(
         """
-## Cell 2: Automated Dataset Acquisition
+## Cell 2: Automated Baseline Dataset Acquisition
 
-The notebook restores cached raw folders from Drive first, then downloads missing datasets from Roboflow or Kaggle/KaggleHub. Successful downloads are cached back to Drive so a disconnected Colab runtime can recover without starting from zero.
+This cell tries Drive cache, `raw_datasets.zip`, Roboflow, and Kaggle/KaggleHub. If the seven raw datasets are missing but completed model weights already exist in Drive, it continues instead of blocking recovery.
 """
     ),
     code(
@@ -290,7 +387,6 @@ def restore_from_drive_cache() -> None:
         for source in DATASET_SOURCES:
             if not dataset_ready(REPO_ROOT / source["folder"]):
                 materialize_dataset(source, extract_root)
-
     for name in EXPECTED_DATASETS:
         cached = RAW_CACHE_DIR / name
         target = REPO_ROOT / name
@@ -302,8 +398,7 @@ def restore_from_drive_cache() -> None:
 def cache_dataset_to_drive(name: str) -> None:
     if not CACHE_RAW_DATASETS_TO_DRIVE:
         return
-    source = REPO_ROOT / name
-    target = RAW_CACHE_DIR / name
+    source, target = REPO_ROOT / name, RAW_CACHE_DIR / name
     if dataset_ready(source) and (FORCE_DOWNLOAD_DATASETS or not dataset_ready(target)):
         print(f"Caching dataset to Drive: {name}")
         if target.exists():
@@ -350,7 +445,6 @@ def download_kaggle_source(source: dict) -> bool:
             return True
     except Exception as exc:
         print(f"KaggleHub download failed for {source['folder']}: {exc}")
-
     if KAGGLE_USERNAME and KAGGLE_KEY:
         install_package_once("kaggle")
         kaggle_dir = Path.home() / ".kaggle"
@@ -389,49 +483,33 @@ for name in EXPECTED_DATASETS:
     cache_dataset_to_drive(name)
 
 missing = expected_missing()
-if missing:
-    raise RuntimeError(f"Automated dataset acquisition did not complete these folders: {missing}. Check Drive logs and credentials.")
-mark_done("dataset_acquisition", {"datasets": EXPECTED_DATASETS})
-print("All baseline datasets are ready.")
+DATASETS_AVAILABLE = not missing
+STATE.setdefault("decisions", {})["baseline_datasets_available"] = DATASETS_AVAILABLE
+STATE["decisions"]["missing_baseline_datasets"] = missing
+save_state()
+
+if missing and previous_training_available():
+    print("Baseline datasets are incomplete, but previous Drive training artifacts are available. Recovery/training cells will reuse those weights.")
+elif missing:
+    raise RuntimeError(f"Missing baseline datasets and no completed training artifacts were found: {missing}")
+else:
+    print("All baseline datasets are ready.")
+    mark_done("dataset_acquisition", {"datasets": EXPECTED_DATASETS})
 '''
     ),
     md(
         """
-## Cell 3: Verify Project Files
+## Cell 3: Self-Materialize Configs and Scripts
 
-The required scripts live in the repository as normal Python files. This cell checks that they exist and compiles them before execution.
+The notebook writes the required repository files itself. It does not depend on the clone already having the latest scripts, so Colab can recover from an older clone or a zip extraction.
 """
     ),
-    code(
-        r'''
-import py_compile
-
-REQUIRED_PROJECT_FILES = [
-    "configs/merge_config.yaml",
-    "configs/domain_sweep_manifest.csv",
-    "scripts/merge_datasets.py",
-    "scripts/extract_severity_crops.py",
-    "scripts/domain_sweep.py",
-    "scripts/auto_collect_domain_sources.py",
-    "scripts/build_domain_adaptation_dataset.py",
-    "scripts/build_severity_adaptation_dataset.py",
-    "apps/inference_api.py",
-]
-missing_files = [path for path in REQUIRED_PROJECT_FILES if not (REPO_ROOT / path).exists()]
-if missing_files:
-    raise FileNotFoundError(f"Missing required project files: {missing_files}")
-for relative_path in REQUIRED_PROJECT_FILES:
-    if relative_path.endswith(".py"):
-        py_compile.compile(str(REPO_ROOT / relative_path), doraise=True)
-print("Project files are present and Python scripts compiled successfully.")
-mark_done("verify_project_files", {"files": REQUIRED_PROJECT_FILES})
-'''
-    ),
+    code(materialize_project_cell()),
     md(
         """
-## Cell 4: Merge Detection Dataset and Extract Severity Crops
+## Cell 4: Build Baseline Datasets When Needed
 
-`merge_datasets.py` is called with `--preserve-splits`, preventing global pooling/shuffling leakage. Severity crops are extracted from the original datasets before merging, using normalized YOLO boxes and OpenCV crops.
+This preserves source train/valid/test splits and extracts severity crops. If datasets are missing but completed baseline weights already exist, this cell skips dataset building so the notebook can recover previous training instead of blocking.
 """
     ),
     code(
@@ -439,29 +517,34 @@ mark_done("verify_project_files", {"files": REQUIRED_PROJECT_FILES})
 MERGED_DATASET = REPO_ROOT / "merged_dataset"
 SEVERITY_DATASET = REPO_ROOT / "severity_dataset"
 
-if FORCE_REBUILD_DATASETS or not step_done("merge_detection_dataset", [MERGED_DATASET / "data.yaml"]):
-    run_process([sys.executable, "scripts/merge_datasets.py", "--config", "configs/merge_config.yaml", "--preserve-splits", "--force"], log_name="merge_detection_dataset")
-    mark_done("merge_detection_dataset", {"data_yaml": str(MERGED_DATASET / "data.yaml")})
+if not DATASETS_AVAILABLE and previous_training_available():
+    print("Skipping baseline dataset build because previous trained weights are recoverable and raw datasets are incomplete.")
+elif not DATASETS_AVAILABLE:
+    raise RuntimeError("Cannot build baseline datasets because raw baseline datasets are incomplete.")
 else:
-    print("Merged detection dataset already exists; skipping rebuild.")
+    if FORCE_REBUILD_DATASETS or not step_done("merge_detection_dataset", [MERGED_DATASET / "data.yaml"]):
+        run_process([sys.executable, "scripts/merge_datasets.py", "--config", "configs/merge_config.yaml", "--preserve-splits", "--force"], log_name="merge_detection_dataset")
+        mark_done("merge_detection_dataset", {"data_yaml": str(MERGED_DATASET / "data.yaml")})
+    else:
+        print("Merged detection dataset already exists; skipping rebuild.")
 
-if FORCE_REBUILD_DATASETS or not step_done("extract_severity_crops", [SEVERITY_DATASET / "data.yaml"]):
-    run_process([sys.executable, "scripts/extract_severity_crops.py", "--config", "configs/merge_config.yaml", "--output", str(SEVERITY_DATASET), "--force"], log_name="extract_severity_crops")
-    mark_done("extract_severity_crops", {"data_yaml": str(SEVERITY_DATASET / "data.yaml")})
-else:
-    print("Severity crop dataset already exists; skipping extraction.")
+    if FORCE_REBUILD_DATASETS or not step_done("extract_severity_crops", [SEVERITY_DATASET / "data.yaml"]):
+        run_process([sys.executable, "scripts/extract_severity_crops.py", "--config", "configs/merge_config.yaml", "--output", str(SEVERITY_DATASET), "--force"], log_name="extract_severity_crops")
+        mark_done("extract_severity_crops", {"data_yaml": str(SEVERITY_DATASET / "data.yaml")})
+    else:
+        print("Severity crop dataset already exists; skipping extraction.")
 
-for summary in [MERGED_DATASET / "merge_summary.json", SEVERITY_DATASET / "severity_summary.json"]:
-    if summary.exists():
-        mirror_path(summary, DRIVE_OUTPUT_ROOT / "summaries" / summary.name)
-        print(summary.read_text(encoding="utf-8")[:2000])
+    for summary in [MERGED_DATASET / "merge_summary.json", SEVERITY_DATASET / "severity_summary.json"]:
+        if summary.exists():
+            mirror_path(summary, DRIVE_OUTPUT_ROOT / "summaries" / summary.name)
+            print(summary.read_text(encoding="utf-8")[:2000])
 '''
     ),
     md(
         """
-## Cell 5: Initial Model Training
+## Cell 5: Recover or Train Baseline Models
 
-Stage 1 uses `yolo11s.pt` for 100 epochs at 640 resolution. Stage 2 uses `yolo11n-cls.pt` for 50 epochs at 224 resolution. Training runs and final weights are saved to Drive; interrupted runs resume from `last.pt` when possible.
+This is the important recovery stage. The notebook first checks canonical Drive weights, then searches Drive run folders for completed `best.pt`, then resumes `last.pt` if data exists. It trains only when no previous usable artifact exists.
 """
     ),
     code(
@@ -477,29 +560,51 @@ def train_device_kwargs() -> dict:
     return {"device": 0} if torch is not None and torch.cuda.is_available() else {}
 
 
-def copy_weight_to_local(drive_weight: Path, local_name: str) -> None:
-    if drive_weight.exists():
-        target = WEIGHTS_DIR / local_name
-        shutil.copy2(drive_weight, target)
-        print(f"Local model ready: {target}")
+def recover_completed_weight(kind: str, final_weight: Path, local_name: str) -> Path | None:
+    if final_weight.exists() and not FORCE_INITIAL_TRAINING:
+        print(f"Using existing canonical {kind} weight: {final_weight}")
+        copy_weight_to_local(final_weight, local_name)
+        return final_weight
+    candidates = checkpoint_candidates(kind, "best.pt")
+    if candidates and not FORCE_INITIAL_TRAINING:
+        best = candidates[0]
+        print(f"Recovered completed {kind} training from: {best}")
+        final_weight.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(best, final_weight)
+        copy_weight_to_local(final_weight, local_name)
+        return final_weight
+    return None
 
 
-def train_or_resume(seed_weights: str | Path, data_path: Path, run_name: str, final_weight: Path, train_args: dict, force: bool = False) -> Path:
+def latest_last_checkpoint(kind: str) -> Path | None:
+    candidates = checkpoint_candidates(kind, "last.pt")
+    return candidates[0] if candidates else None
+
+
+def train_or_resume(kind: str, seed_weights: str | Path, data_path: Path, run_name: str, final_weight: Path, local_name: str, train_args: dict, force: bool = False) -> Path:
+    recovered = recover_completed_weight(kind, final_weight, local_name)
+    if recovered and not force:
+        return recovered
+
+    if not Path(data_path).exists():
+        last = latest_last_checkpoint(kind)
+        if last:
+            raise RuntimeError(f"Found interrupted {kind} checkpoint at {last}, but training data is missing, so resume is not safe.")
+        raise RuntimeError(f"No recoverable {kind} weight was found and training data is missing: {data_path}")
+
     run_dir = DRIVE_RUNS_ROOT / run_name
     best = run_dir / "weights" / "best.pt"
     last = run_dir / "weights" / "last.pt"
-    if final_weight.exists() and not force:
-        print(f"Using existing trained weight: {final_weight}")
-        return final_weight
     if force and run_dir.exists():
         shutil.rmtree(run_dir)
     if best.exists() and not force:
-        print(f"Recovered completed training run from: {best}")
+        print(f"Recovered completed {kind} run from: {best}")
         final_weight.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(best, final_weight)
+        copy_weight_to_local(final_weight, local_name)
         return final_weight
-    if last.exists() and not force and not best.exists():
-        print(f"Resuming interrupted training from: {last}")
+    if last.exists() and not force:
+        print(f"Resuming interrupted {kind} training from: {last}")
         YOLO(str(last)).train(resume=True)
     else:
         YOLO(str(seed_weights)).train(
@@ -516,11 +621,10 @@ def train_or_resume(seed_weights: str | Path, data_path: Path, run_name: str, fi
         raise FileNotFoundError(f"Training finished but best.pt was not found: {best}")
     final_weight.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(best, final_weight)
+    copy_weight_to_local(final_weight, local_name)
     return final_weight
 
 
-DETECTOR_WEIGHT = DRIVE_WEIGHTS_ROOT / "defect_detector.pt"
-SEVERITY_WEIGHT = DRIVE_WEIGHTS_ROOT / "severity_cls.pt"
 detector_args = {
     "epochs": 100, "imgsz": 640, "patience": 20, "optimizer": "AdamW", "cos_lr": True,
     "close_mosaic": 10, "mosaic": 0.60, "mixup": 0.05, "copy_paste": 0.10,
@@ -529,42 +633,70 @@ detector_args = {
 }
 severity_args = {"epochs": 50, "imgsz": 224, "patience": 12, "optimizer": "AdamW", "cos_lr": True, "dropout": 0.15}
 
-trained_detector = train_or_resume("yolo11s.pt", MERGED_DATASET / "data.yaml", "stage1_defect_detector", DETECTOR_WEIGHT, detector_args, FORCE_INITIAL_TRAINING)
-trained_severity = train_or_resume("yolo11n-cls.pt", SEVERITY_DATASET, "stage2_severity", SEVERITY_WEIGHT, severity_args, FORCE_INITIAL_TRAINING)
-copy_weight_to_local(trained_detector, "defect_detector.pt")
-copy_weight_to_local(trained_severity, "severity_cls.pt")
-mark_done("initial_training", {"detector": str(trained_detector), "severity": str(trained_severity)})
+trained_detector = train_or_resume("detector", "yolo11s.pt", MERGED_DATASET / "data.yaml", "stage1_defect_detector", DETECTOR_WEIGHT, "defect_detector.pt", detector_args, FORCE_INITIAL_TRAINING)
+trained_severity = train_or_resume("severity", "yolo11n-cls.pt", SEVERITY_DATASET, "stage2_severity", SEVERITY_WEIGHT, "severity_cls.pt", severity_args, FORCE_INITIAL_TRAINING)
+mark_done("baseline_model_recovery_or_training", {"detector": str(trained_detector), "severity": str(trained_severity)})
 '''
     ),
     md(
         """
-## Cell 6: Reuse or Run the Domain Sweep
+## Cell 6: Domain Sweep With Explicit Image Sources
 
-This cell reuses `output/domain_sweep/domain_sweep_summary.csv` if it exists locally or in Drive. It only runs the sweep again when cached results are missing or `FORCE_SWEEP = True`.
+This cell prints the exact sweep images from `configs/domain_sweep_manifest.csv`. It reuses cached sweep results only when the manifest fingerprint matches, so old local-path sweeps are not silently reused.
 """
     ),
     code(
         r'''
 BASELINE_SWEEP_DIR = REPO_ROOT / "output" / "domain_sweep"
 DRIVE_BASELINE_SWEEP_DIR = DRIVE_OUTPUT_ROOT / "domain_sweep" / "baseline"
+MANIFEST_PATH = REPO_ROOT / "configs" / "domain_sweep_manifest.csv"
 
 
-def sweep_ready(path: Path) -> bool:
-    return (path / "domain_sweep_summary.csv").exists() and (path / "summary.json").exists()
+def file_hash(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def sweep_fingerprint_path(path: Path) -> Path:
+    return Path(path) / "manifest_sha256.txt"
+
+
+def sweep_ready(path: Path, manifest_path: Path) -> bool:
+    path = Path(path)
+    fingerprint = sweep_fingerprint_path(path)
+    return (
+        (path / "domain_sweep_summary.csv").exists()
+        and (path / "summary.json").exists()
+        and fingerprint.exists()
+        and fingerprint.read_text(encoding="utf-8").strip() == file_hash(manifest_path)
+    )
+
+
+def write_sweep_fingerprint(path: Path, manifest_path: Path) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+    sweep_fingerprint_path(path).write_text(file_hash(manifest_path), encoding="utf-8")
+
+
+def print_sweep_sources(manifest_path: Path) -> None:
+    print("Sweep image sources:")
+    with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            chosen = row.get("image_url") or row.get("local_path") or row.get("source_url")
+            print(f"- {row['id']} [{row['domain_group']} -> {row['expected_class']}]: {chosen}")
 
 
 def reuse_or_run_sweep(output_dir: Path, drive_dir: Path, detector_weight: Path, name: str, force: bool = False) -> Path:
-    if sweep_ready(output_dir) and not force:
-        print(f"Reusing local sweep: {output_dir}")
+    print_sweep_sources(MANIFEST_PATH)
+    if sweep_ready(output_dir, MANIFEST_PATH) and not force:
+        print(f"Reusing local sweep with matching manifest: {output_dir}")
         mirror_path(output_dir, drive_dir)
         return output_dir
-    if sweep_ready(drive_dir) and not force:
-        print(f"Restoring sweep from Drive: {drive_dir}")
+    if sweep_ready(drive_dir, MANIFEST_PATH) and not force:
+        print(f"Restoring matching sweep from Drive: {drive_dir}")
         mirror_path(drive_dir, output_dir)
         return output_dir
     run_process([
         sys.executable, "scripts/domain_sweep.py",
-        "--manifest", "configs/domain_sweep_manifest.csv",
+        "--manifest", str(MANIFEST_PATH),
         "--detector", str(detector_weight),
         "--severity", str(SEVERITY_WEIGHT),
         "--output", str(output_dir),
@@ -572,20 +704,21 @@ def reuse_or_run_sweep(output_dir: Path, drive_dir: Path, detector_weight: Path,
         "--iou", "0.45",
         "--annotate-conf", "0.20",
     ], log_name=name)
+    write_sweep_fingerprint(output_dir, MANIFEST_PATH)
     mirror_path(output_dir, drive_dir)
     return output_dir
 
 
 baseline_sweep = reuse_or_run_sweep(BASELINE_SWEEP_DIR, DRIVE_BASELINE_SWEEP_DIR, DETECTOR_WEIGHT, "baseline_domain_sweep", FORCE_SWEEP)
 print((baseline_sweep / "summary.json").read_text(encoding="utf-8"))
-mark_done("baseline_domain_sweep", {"path": str(baseline_sweep)})
+mark_done("baseline_domain_sweep", {"path": str(baseline_sweep), "manifest_sha256": file_hash(MANIFEST_PATH)})
 '''
     ),
     md(
         """
-## Cell 7: Automated Target-Domain Recollection
+## Cell 7: Automated Target-Domain Recollection and Conditional Retraining
 
-The weak-domain sweep showed mismatch on exterior facades, paint degradation, wall cracks, spalling, and corrosion. This cell recollects extra annotated facility/facade datasets from Roboflow Universe and remaps them into the five detection classes.
+This stage collects additional facade/building defect datasets, remaps labels into the five classes, decides whether domain retraining is justified, builds the adapted dataset, and fine-tunes Stage 1 only when useful.
 """
     ),
     code(
@@ -593,37 +726,39 @@ The weak-domain sweep showed mismatch on exterior facades, paint degradation, wa
 TARGET_YOLO = REPO_ROOT / "domain_adaptation" / "target_yolo"
 AUTO_RAW = REPO_ROOT / "domain_adaptation" / "auto_raw"
 TARGET_SUMMARY = TARGET_YOLO / "auto_collection_summary.json"
+DOMAIN_ADAPTED_DATASET = REPO_ROOT / "merged_dataset_domain_adapted"
+HARD_NEGATIVES = REPO_ROOT / "domain_adaptation" / "hard_negatives"
 
 
 def count_images(root: Path) -> int:
     return sum(1 for path in Path(root).glob("**/*") if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}) if Path(root).exists() else 0
 
 
+def target_label_count(target_root: Path) -> int:
+    total = 0
+    for label_path in target_root.glob("**/*.txt"):
+        total += len([line for line in label_path.read_text(encoding="utf-8").splitlines() if line.strip()])
+    return total
+
+
 if FORCE_DOMAIN_COLLECTION or not TARGET_SUMMARY.exists() or count_images(TARGET_YOLO) == 0:
-    run_process([
-        sys.executable, "scripts/auto_collect_domain_sources.py",
-        "--api-key", ROBOFLOW_API_KEY,
-        "--raw-output", str(AUTO_RAW),
-        "--target-output", str(TARGET_YOLO),
-    ] + (["--force-download", "--force-rebuild"] if FORCE_DOMAIN_COLLECTION else []), log_name="auto_collect_domain_sources")
+    if not ROBOFLOW_API_KEY:
+        print("ROBOFLOW_API_KEY is missing; target-domain recollection skipped.")
+    else:
+        run_process([
+            sys.executable, "scripts/auto_collect_domain_sources.py",
+            "--api-key", ROBOFLOW_API_KEY,
+            "--raw-output", str(AUTO_RAW),
+            "--target-output", str(TARGET_YOLO),
+        ] + (["--force-download", "--force-rebuild"] if FORCE_DOMAIN_COLLECTION else []), log_name="auto_collect_domain_sources")
 else:
     print(f"Using existing target-domain collection: {TARGET_YOLO}")
 
 if TARGET_SUMMARY.exists():
     mirror_path(TARGET_SUMMARY, DRIVE_OUTPUT_ROOT / "summaries" / "auto_collection_summary.json")
     print(TARGET_SUMMARY.read_text(encoding="utf-8")[:3000])
-mark_done("auto_target_domain_collection", {"target_yolo": str(TARGET_YOLO), "images": count_images(TARGET_YOLO)})
-'''
-    ),
-    md(
-        """
-## Cell 8: Decide Whether Retraining Is Needed
 
-Domain retraining is triggered only when the sweep has failed rows and the recollection produced usable target-domain labels. Use `FORCE_DOMAIN_RETRAIN = True` to override.
-"""
-    ),
-    code(
-        r'''
+
 def load_sweep_rows(summary_csv: Path) -> list[dict]:
     if not summary_csv.exists():
         return []
@@ -635,40 +770,21 @@ def failure_count(rows: list[dict], thresholds=("0.45", "0.3", "0.30", "0.2", "0
     return sum(1 for row in rows if str(row.get("threshold", "")) in thresholds and row.get("match") == "false")
 
 
-def target_label_count(target_root: Path) -> int:
-    total = 0
-    for label_path in target_root.glob("**/*.txt"):
-        total += len([line for line in label_path.read_text(encoding="utf-8").splitlines() if line.strip()])
-    return total
-
-
 rows = load_sweep_rows(BASELINE_SWEEP_DIR / "domain_sweep_summary.csv")
 weak_rows = failure_count(rows)
 target_images = count_images(TARGET_YOLO)
 target_labels = target_label_count(TARGET_YOLO)
-NEEDS_DOMAIN_RETRAIN = FORCE_DOMAIN_RETRAIN or (weak_rows > 0 and target_images >= 10 and target_labels >= 10)
+NEEDS_DOMAIN_RETRAIN = FORCE_DOMAIN_RETRAIN or (DATASETS_AVAILABLE and weak_rows > 0 and target_images >= 10 and target_labels >= 10)
 STATE.setdefault("decisions", {})["needs_domain_retrain"] = NEEDS_DOMAIN_RETRAIN
 STATE["decisions"]["domain_retrain_reason"] = {
+    "datasets_available": DATASETS_AVAILABLE,
     "weak_sweep_rows": weak_rows,
     "target_images": target_images,
     "target_labels": target_labels,
     "force": FORCE_DOMAIN_RETRAIN,
 }
 save_state()
-print(json.dumps(STATE["decisions"], indent=2))
-'''
-    ),
-    md(
-        """
-## Cell 9: Build the Domain-Adapted Detection Dataset
-
-If retraining is needed, the notebook combines the original merged data, recollected target-domain labels, and optional hard negatives into `merged_dataset_domain_adapted`.
-"""
-    ),
-    code(
-        r'''
-DOMAIN_ADAPTED_DATASET = REPO_ROOT / "merged_dataset_domain_adapted"
-HARD_NEGATIVES = REPO_ROOT / "domain_adaptation" / "hard_negatives"
+print(json.dumps(STATE["decisions"]["domain_retrain_reason"], indent=2))
 
 
 def create_hard_negatives_from_sweep(resolved_manifest: Path, output_root: Path) -> int:
@@ -701,29 +817,7 @@ if NEEDS_DOMAIN_RETRAIN:
             "--target-repeat", "3",
             "--negative-repeat", "2",
         ], log_name="build_domain_adapted_dataset")
-    if (DOMAIN_ADAPTED_DATASET / "domain_adaptation_summary.json").exists():
-        mirror_path(DOMAIN_ADAPTED_DATASET / "domain_adaptation_summary.json", DRIVE_OUTPUT_ROOT / "summaries" / "domain_adaptation_summary.json")
-        print((DOMAIN_ADAPTED_DATASET / "domain_adaptation_summary.json").read_text(encoding="utf-8")[:3000])
-else:
-    print("Domain retraining is not needed by the current decision gate; dataset build skipped.")
-mark_done("build_domain_adapted_dataset", {"needed": NEEDS_DOMAIN_RETRAIN, "output": str(DOMAIN_ADAPTED_DATASET)})
-'''
-    ),
-    md(
-        """
-## Cell 10: Fine-Tune Stage 1 on Target-Domain Data
 
-This is the core low-confidence/misclassification fix: the detector sees more facility/facade examples, target data is oversampled, and hard negatives reduce false positives. The adapted model can be promoted to the dashboard default.
-"""
-    ),
-    code(
-        r'''
-DOMAIN_DETECTOR_WEIGHT = DRIVE_WEIGHTS_ROOT / "defect_detector_domain_adapted.pt"
-
-if NEEDS_DOMAIN_RETRAIN:
-    baseline_backup = DRIVE_WEIGHTS_ROOT / "defect_detector_baseline.pt"
-    if DETECTOR_WEIGHT.exists() and not baseline_backup.exists():
-        shutil.copy2(DETECTOR_WEIGHT, baseline_backup)
     domain_args = {
         "epochs": 60, "imgsz": 640, "patience": 15, "optimizer": "AdamW", "lr0": 0.001,
         "cos_lr": True, "close_mosaic": 8, "mosaic": 0.45, "mixup": 0.03,
@@ -731,96 +825,28 @@ if NEEDS_DOMAIN_RETRAIN:
         "fliplr": 0.50, "hsv_s": 0.35, "hsv_v": 0.30,
     }
     trained_domain_detector = train_or_resume(
+        "detector",
         DETECTOR_WEIGHT if DETECTOR_WEIGHT.exists() else "yolo11s.pt",
         DOMAIN_ADAPTED_DATASET / "data.yaml",
         "stage1_domain_adapted_detector",
         DOMAIN_DETECTOR_WEIGHT,
+        "defect_detector_domain_adapted.pt",
         domain_args,
         FORCE_DOMAIN_RETRAIN,
     )
-    copy_weight_to_local(trained_domain_detector, "defect_detector_domain_adapted.pt")
     if PROMOTE_DOMAIN_ADAPTED_MODEL:
         shutil.copy2(trained_domain_detector, DETECTOR_WEIGHT)
         copy_weight_to_local(DETECTOR_WEIGHT, "defect_detector.pt")
-        print("Domain-adapted detector promoted as the default deployment detector.")
     mark_done("domain_detector_training", {"detector": str(trained_domain_detector), "promoted": PROMOTE_DOMAIN_ADAPTED_MODEL})
 else:
-    print("Domain detector fine-tuning skipped because retraining was not needed.")
+    print("Domain retraining skipped by decision gate.")
 '''
     ),
     md(
         """
-## Cell 11: Optional Automated Stage 2 Severity Adaptation
+## Cell 8: Post-Adaptation Check and Deployment Weights
 
-When raw target-domain downloads include detailed labels, this cell extracts extra severity crops and retrains the classifier only if enough extra crops exist.
-"""
-    ),
-    code(
-        r'''
-import yaml
-
-SEVERITY_EXTRA = REPO_ROOT / "domain_adaptation" / "severity_extra"
-SEVERITY_ADAPTED_DATASET = REPO_ROOT / "severity_dataset_domain_adapted"
-DOMAIN_SEVERITY_WEIGHT = DRIVE_WEIGHTS_ROOT / "severity_cls_domain_adapted.pt"
-
-
-def write_auto_severity_config(raw_root: Path) -> Path | None:
-    datasets = []
-    for data_yaml in sorted(raw_root.glob("*/**/data.yaml")):
-        root = data_yaml.parent
-        if any((root / split / "images").exists() for split in ("train", "valid", "val", "test")):
-            datasets.append({"name": root.parent.name if root.name == "data" else root.name, "path": str(root)})
-    if not datasets:
-        return None
-    config_path = REPO_ROOT / "domain_adaptation" / "auto_severity_config.yaml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.safe_dump({"datasets": datasets}, sort_keys=False), encoding="utf-8")
-    return config_path
-
-
-severity_config = write_auto_severity_config(AUTO_RAW)
-if severity_config is not None and (FORCE_REBUILD_DATASETS or not (SEVERITY_EXTRA / "data.yaml").exists()):
-    run_process([sys.executable, "scripts/extract_severity_crops.py", "--config", str(severity_config), "--output", str(SEVERITY_EXTRA), "--force"], log_name="extract_target_severity_crops")
-elif severity_config is None:
-    print("No raw target-domain folders were available for automatic severity crop extraction.")
-
-extra_crops = count_images(SEVERITY_EXTRA)
-NEEDS_SEVERITY_RETRAIN = FORCE_SEVERITY_RETRAIN or (extra_crops >= 10 and NEEDS_DOMAIN_RETRAIN)
-STATE.setdefault("decisions", {})["needs_severity_retrain"] = NEEDS_SEVERITY_RETRAIN
-STATE["decisions"]["severity_retrain_reason"] = {"extra_crops": extra_crops, "force": FORCE_SEVERITY_RETRAIN}
-save_state()
-
-if NEEDS_SEVERITY_RETRAIN:
-    if FORCE_REBUILD_DATASETS or not (SEVERITY_ADAPTED_DATASET / "severity_adaptation_summary.json").exists():
-        run_process([
-            sys.executable, "scripts/build_severity_adaptation_dataset.py",
-            "--base", str(SEVERITY_DATASET),
-            "--target", str(SEVERITY_EXTRA),
-            "--output", str(SEVERITY_ADAPTED_DATASET),
-            "--target-repeat", "3",
-        ], log_name="build_severity_adapted_dataset")
-    severity_adapt_args = {"epochs": 40, "imgsz": 224, "patience": 10, "optimizer": "AdamW", "lr0": 0.001, "cos_lr": True, "dropout": 0.20}
-    trained_domain_severity = train_or_resume(
-        SEVERITY_WEIGHT if SEVERITY_WEIGHT.exists() else "yolo11n-cls.pt",
-        SEVERITY_ADAPTED_DATASET,
-        "stage2_domain_adapted_severity",
-        DOMAIN_SEVERITY_WEIGHT,
-        severity_adapt_args,
-        FORCE_SEVERITY_RETRAIN,
-    )
-    shutil.copy2(trained_domain_severity, SEVERITY_WEIGHT)
-    copy_weight_to_local(SEVERITY_WEIGHT, "severity_cls.pt")
-    mark_done("domain_severity_training", {"severity": str(trained_domain_severity)})
-else:
-    print("Severity retraining skipped. Extra target-domain severity crops are not sufficient yet.")
-print(json.dumps(STATE["decisions"], indent=2))
-'''
-    ),
-    md(
-        """
-## Cell 12: Post-Adaptation Acceptance Sweep
-
-After retraining, the same sweep is rerun with the adapted detector and a before/after summary is saved to Drive.
+This final section reruns the sweep only after an adapted detector is trained, then makes canonical local deployment names available for the dashboard/backend.
 """
     ),
     code(
@@ -841,7 +867,7 @@ def summarize_matches(summary_csv: Path, threshold: str = "0.2") -> dict:
     }
 
 
-if NEEDS_DOMAIN_RETRAIN and DOMAIN_DETECTOR_WEIGHT.exists():
+if STATE.get("steps", {}).get("domain_detector_training") and DOMAIN_DETECTOR_WEIGHT.exists():
     post_sweep = reuse_or_run_sweep(POST_SWEEP_DIR, DRIVE_POST_SWEEP_DIR, DOMAIN_DETECTOR_WEIGHT, "domain_adapted_sweep", FORCE_SWEEP)
     comparison = {
         "baseline_at_conf_0_20": summarize_matches(BASELINE_SWEEP_DIR / "domain_sweep_summary.csv", "0.2"),
@@ -852,21 +878,11 @@ if NEEDS_DOMAIN_RETRAIN and DOMAIN_DETECTOR_WEIGHT.exists():
     comparison_path = DRIVE_OUTPUT_ROOT / "summaries" / "domain_sweep_before_after.json"
     comparison_path.write_text(json.dumps(comparison, indent=2), encoding="utf-8")
     print(json.dumps(comparison, indent=2))
-    mark_done("post_domain_sweep", comparison)
 else:
-    print("Post-adaptation sweep skipped because no domain-adapted detector was trained in this run.")
-    print(json.dumps({"baseline_at_conf_0_20": summarize_matches(BASELINE_SWEEP_DIR / "domain_sweep_summary.csv", "0.2")}, indent=2))
-'''
-    ),
-    md(
-        """
-## Cell 13: Deployment Artifacts
+    print("No new domain-adapted detector was trained in this run.")
+    if (BASELINE_SWEEP_DIR / "domain_sweep_summary.csv").exists():
+        print(json.dumps({"baseline_at_conf_0_20": summarize_matches(BASELINE_SWEEP_DIR / "domain_sweep_summary.csv", "0.2")}, indent=2))
 
-The dashboard/backend discover `.pt` files from `weights/` and Drive. This cell makes sure the canonical local names are present for deployment.
-"""
-    ),
-    code(
-        r'''
 for drive_weight, local_name in [
     (DETECTOR_WEIGHT, "defect_detector.pt"),
     (SEVERITY_WEIGHT, "severity_cls.pt"),
@@ -899,8 +915,8 @@ notebook = {
     "nbformat_minor": 5,
 }
 
-out = Path(__file__).resolve().parents[1] / "two_stage_yolo_defect_pipeline_colab.ipynb"
-out.write_text(json.dumps(notebook, indent=2), encoding="utf-8")
-print(f"Wrote {out} with {len(cells)} cells")
-print(f"Markdown cells: {sum(1 for cell in cells if cell['cell_type'] == 'markdown')}")
-print(f"Code cells: {sum(1 for cell in cells if cell['cell_type'] == 'code')}")
+output_path = REPO_ROOT / "two_stage_yolo_defect_pipeline_colab.ipynb"
+output_path.write_text(json.dumps(notebook, indent=2), encoding="utf-8")
+print(f"Wrote {output_path} with {len(cells)} cells")
+print(f"Markdown cells: {sum(cell['cell_type'] == 'markdown' for cell in cells)}")
+print(f"Code cells: {sum(cell['cell_type'] == 'code' for cell in cells)}")

@@ -1,5 +1,5 @@
 id,domain_group,expected_class,local_path,image_url,source_url,notes
-user_siding_damage,exterior_facade,paint_degradation|spalling,C:/Users/User/Downloads/download (1).jpg,,,User-provided exterior siding/wall damage sample
+exterior_facade_peeling,exterior_facade,paint_degradation|spalling,,https://commons.wikimedia.org/wiki/Special:FilePath/Peeling%20paint%201.jpg,https://commons.wikimedia.org/wiki/File:Peeling_paint_1.jpg,Exterior/facade-like peeling paint sample used instead of a local Windows path
 concrete_cracked_texture,concrete_crack,crack,,https://commons.wikimedia.org/wiki/Special:FilePath/Concrete%20cracked.jpg,https://commons.wikimedia.org/wiki/File:Concrete_cracked.jpg,Public concrete crack texture
 cracked_wall_building,wall_crack,crack,,https://commons.wikimedia.org/wiki/Special:FilePath/Cracked%20wall.jpg,https://commons.wikimedia.org/wiki/File:Cracked_wall.jpg,Building wall crack
 crack_in_wall,wall_crack,crack,,https://commons.wikimedia.org/wiki/Special:FilePath/Crack%20in%20the%20wall.jpg,https://commons.wikimedia.org/wiki/File:Crack_in_the_wall.jpg,Vertical wall crack
