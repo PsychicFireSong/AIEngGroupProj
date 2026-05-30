@@ -560,11 +560,13 @@ def train_device_kwargs() -> dict:
     return {"device": 0} if torch is not None and torch.cuda.is_available() else {}
 
 
-def recover_completed_weight(kind: str, final_weight: Path, local_name: str) -> Path | None:
+def recover_completed_weight(kind: str, final_weight: Path, local_name: str, allow_kind_search: bool = True) -> Path | None:
     if final_weight.exists() and not FORCE_INITIAL_TRAINING:
         print(f"Using existing canonical {kind} weight: {final_weight}")
         copy_weight_to_local(final_weight, local_name)
         return final_weight
+    if not allow_kind_search:
+        return None
     candidates = checkpoint_candidates(kind, "best.pt")
     if candidates and not FORCE_INITIAL_TRAINING:
         best = candidates[0]
@@ -581,8 +583,18 @@ def latest_last_checkpoint(kind: str) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def train_or_resume(kind: str, seed_weights: str | Path, data_path: Path, run_name: str, final_weight: Path, local_name: str, train_args: dict, force: bool = False) -> Path:
-    recovered = recover_completed_weight(kind, final_weight, local_name)
+def train_or_resume(
+    kind: str,
+    seed_weights: str | Path,
+    data_path: Path,
+    run_name: str,
+    final_weight: Path,
+    local_name: str,
+    train_args: dict,
+    force: bool = False,
+    allow_kind_search: bool = True,
+) -> Path:
+    recovered = recover_completed_weight(kind, final_weight, local_name, allow_kind_search)
     if recovered and not force:
         return recovered
 
@@ -718,7 +730,7 @@ mark_done("baseline_domain_sweep", {"path": str(baseline_sweep), "manifest_sha25
         """
 ## Cell 7: Automated Target-Domain Recollection and Conditional Retraining
 
-This stage collects additional facade/building defect datasets, remaps labels into the five classes, decides whether domain retraining is justified, builds the adapted dataset, and fine-tunes Stage 1 only when useful.
+This stage collects additional facade/building defect datasets, remaps labels into the five Stage 1 classes, decides whether domain retraining is justified, builds the adapted dataset, fine-tunes Stage 1, then extracts target-domain crops and fine-tunes Stage 2 severity when enough severity crops are available.
 """
     ),
     code(
@@ -833,6 +845,7 @@ if NEEDS_DOMAIN_RETRAIN:
         "defect_detector_domain_adapted.pt",
         domain_args,
         FORCE_DOMAIN_RETRAIN,
+        allow_kind_search=False,
     )
     if PROMOTE_DOMAIN_ADAPTED_MODEL:
         shutil.copy2(trained_domain_detector, DETECTOR_WEIGHT)
@@ -840,6 +853,90 @@ if NEEDS_DOMAIN_RETRAIN:
     mark_done("domain_detector_training", {"detector": str(trained_domain_detector), "promoted": PROMOTE_DOMAIN_ADAPTED_MODEL})
 else:
     print("Domain retraining skipped by decision gate.")
+
+
+# Stage 2 severity adaptation is optional but kept in the same 8-section workflow.
+# It uses raw target-domain downloads when they contain detailed labels that can be mapped into minor/moderate/critical.
+import yaml
+
+SEVERITY_EXTRA = REPO_ROOT / "domain_adaptation" / "severity_extra"
+SEVERITY_ADAPTED_DATASET = REPO_ROOT / "severity_dataset_domain_adapted"
+
+
+def write_auto_severity_config(raw_root: Path) -> Path | None:
+    datasets = []
+    for data_yaml in sorted(raw_root.glob("*/**/data.yaml")):
+        root = data_yaml.parent
+        if any((root / split / "images").exists() for split in ("train", "valid", "val", "test")):
+            datasets.append({"name": root.parent.name if root.name == "data" else root.name, "path": str(root)})
+    if not datasets:
+        return None
+    config_path = REPO_ROOT / "domain_adaptation" / "auto_severity_config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump({"datasets": datasets}, sort_keys=False), encoding="utf-8")
+    return config_path
+
+
+severity_config = write_auto_severity_config(AUTO_RAW)
+if severity_config is not None and (FORCE_REBUILD_DATASETS or not (SEVERITY_EXTRA / "data.yaml").exists()):
+    run_process([
+        sys.executable,
+        "scripts/extract_severity_crops.py",
+        "--config",
+        str(severity_config),
+        "--output",
+        str(SEVERITY_EXTRA),
+        "--force",
+    ], log_name="extract_target_severity_crops")
+elif severity_config is None:
+    print("No raw target-domain folders were available for automatic severity crop extraction.")
+
+extra_crops = count_images(SEVERITY_EXTRA)
+NEEDS_SEVERITY_RETRAIN = FORCE_SEVERITY_RETRAIN or (extra_crops >= 10 and NEEDS_DOMAIN_RETRAIN)
+STATE.setdefault("decisions", {})["needs_severity_retrain"] = NEEDS_SEVERITY_RETRAIN
+STATE["decisions"]["severity_retrain_reason"] = {"extra_crops": extra_crops, "force": FORCE_SEVERITY_RETRAIN}
+save_state()
+
+if NEEDS_SEVERITY_RETRAIN:
+    if FORCE_REBUILD_DATASETS or not (SEVERITY_ADAPTED_DATASET / "severity_adaptation_summary.json").exists():
+        run_process([
+            sys.executable,
+            "scripts/build_severity_adaptation_dataset.py",
+            "--base",
+            str(SEVERITY_DATASET),
+            "--target",
+            str(SEVERITY_EXTRA),
+            "--output",
+            str(SEVERITY_ADAPTED_DATASET),
+            "--target-repeat",
+            "3",
+        ], log_name="build_severity_adapted_dataset")
+
+    severity_adapt_args = {
+        "epochs": 40,
+        "imgsz": 224,
+        "patience": 10,
+        "optimizer": "AdamW",
+        "lr0": 0.001,
+        "cos_lr": True,
+        "dropout": 0.20,
+    }
+    trained_domain_severity = train_or_resume(
+        "severity",
+        SEVERITY_WEIGHT if SEVERITY_WEIGHT.exists() else "yolo11n-cls.pt",
+        SEVERITY_ADAPTED_DATASET,
+        "stage2_domain_adapted_severity",
+        DOMAIN_SEVERITY_WEIGHT,
+        "severity_cls_domain_adapted.pt",
+        severity_adapt_args,
+        FORCE_SEVERITY_RETRAIN,
+        allow_kind_search=False,
+    )
+    shutil.copy2(trained_domain_severity, SEVERITY_WEIGHT)
+    copy_weight_to_local(SEVERITY_WEIGHT, "severity_cls.pt")
+    mark_done("domain_severity_training", {"severity": str(trained_domain_severity)})
+else:
+    print("Severity retraining skipped by decision gate.")
 '''
     ),
     md(
