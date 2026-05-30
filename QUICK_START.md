@@ -1,76 +1,76 @@
 # Quick Start
 
-This repo trains a baseline YOLO model on a merged 5-class defect dataset and includes a Streamlit app for inference.
+This repo trains a two-stage YOLO defect pipeline and serves it through a deployable web dashboard.
 
-## 1. Set up Python
+## 1. Set Up Python
 
-From the repo root, activate the project virtual environment if it exists:
+From the repo root, activate your environment if needed:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-Then install the project dependencies:
+Install dependencies:
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-If you are setting up a fresh environment, make sure you are using a Python version that works with Ultralytics and PyTorch on Windows.
-
-## 2. Merge the datasets
-
-The datasets in `archive/` and the other dataset folders are merged into one unified dataset before training.
+## 2. Merge Datasets
 
 ```powershell
-python scripts/merge_datasets.py --config configs/merge_config.yaml
+python scripts/merge_datasets.py --config configs/merge_config.yaml --preserve-splits
 ```
 
-If your class mapping changes, update `configs/merge_config.yaml` first.
+## 3. Train Models
 
-## 3. Train the baseline model
-
-Train the default baseline with YOLO11 nano:
+Primary detector:
 
 ```powershell
-python scripts/train_baseline.py --data merged_dataset/data.yaml --weights yolo11n.pt --epochs 50 --imgsz 640 --batch 16 --device 0
+yolo detect train model=yolo11s.pt data=merged_dataset/data.yaml epochs=100 imgsz=640
 ```
 
-Useful options:
-
-- Use `--device cpu` if you do not have a GPU available.
-- Change `--weights` to `yolo11s.pt` or another checkpoint if you want a stronger starting point.
-- The training output is written under `runs/train/baseline` by default.
-
-## 4. Test the model
-
-The fastest way to test the model is to launch the Streamlit demo and run a few images through it.
+Severity classifier:
 
 ```powershell
-python -m streamlit run apps/inference_app.py
+python scripts/extract_severity_crops.py --config configs/merge_config.yaml
+yolo classify train model=yolo11n-cls.pt data=severity_dataset epochs=50 imgsz=224
 ```
 
-In the app, point the model path to the included `best.pt` file in the repository root, or to `runs/train/baseline/weights/best.pt` if you have trained a new checkpoint.
-
-Recommended test flow:
-
-- Upload a few sample images with visible defects.
-- Try a mixture of close-up and wide shots.
-- Compare the predicted class names against the expected defect type.
-- Adjust confidence and IoU in the sidebar if detections are too noisy or too strict.
-
-## 5. Run inference
-
-Start the Streamlit app from the repo root:
+Copy or rename your trained checkpoints so the API can discover them, for example:
 
 ```powershell
-python -m streamlit run apps/inference_app.py
+New-Item -ItemType Directory -Force weights
+Copy-Item runs\detect\stage1_defect_detector\weights\best.pt weights\defect_detector.pt
+Copy-Item runs\classify\stage2_severity\weights\best.pt weights\severity_cls.pt
 ```
 
-The app will try to load `runs/train/baseline/weights/best.pt` automatically if it exists. If your trained weights live somewhere else, paste that path into the sidebar.
+## 4. Run Inference API
 
-## 6. What to check next
+```powershell
+python -m uvicorn apps.inference_api:app --host 0.0.0.0 --port 8000 --reload
+```
 
-- Confirm that `merged_dataset/data.yaml` was created.
-- Confirm that training produced `runs/train/baseline/weights/best.pt`.
-- Open the Streamlit app and test a few images before using the model on new data.
+Check `http://localhost:8000/health`.
+
+## 5. Run Deployable Dashboard
+
+```powershell
+cd apps/facility-dashboard
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`.
+
+The dashboard is camera-first: visual evidence stays in the center, while live status, metrics, severity mix, defect list, selected finding, distribution, trend, and history palettes update around it.
+
+## 6. Deployment Shape
+
+Recommended final deployment:
+
+- Deploy `apps/facility-dashboard` as the web frontend.
+- Deploy `apps/inference_api.py` as a Python API service with access to the `.pt` model files and GPU if available.
+- Set `NEXT_PUBLIC_INFERENCE_API_URL` in the frontend environment to the public API URL.
+
+The Streamlit app is kept only as a legacy local demo.
