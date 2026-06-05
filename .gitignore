@@ -5,8 +5,16 @@ __pycache__/
 inspection_history/
 
 # Downloaded model checkpoints and Google Drive training exports.
+*.pt
+*.onnx
+*.engine
+*.torchscript
+weights/
 weights/drive_download/
+weights/drive_live_check/
+weights/drive_selected/
 weights/*.pt
+runs/
 
 # Browser verification artifacts.
 .playwright-cli/

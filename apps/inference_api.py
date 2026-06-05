@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import base64
+import os
+import re
+import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
@@ -26,6 +34,7 @@ MODEL_ROOTS = [
     APP_ROOT / "models",
     APP_ROOT / "runs",
     Path("/content/drive/MyDrive/AIEngGroupProj_colab_outputs/weights"),
+    Path("/content/drive/MyDrive/AIEngGroupProj_colab_outputs/runs"),
 ]
 
 SEVERITY_WEIGHTS = {
@@ -44,6 +53,16 @@ COLORS_BGR = {
     "unknown": (184, 196, 148),
 }
 
+MAX_URL_BYTES = int(os.environ.get("AIENG_MAX_URL_BYTES", 250 * 1024 * 1024))
+DEFAULT_VIDEO_SCAN_FPS = float(os.environ.get("AIENG_VIDEO_SCAN_FPS", "1.0"))
+MAX_VIDEO_SCAN_FPS = float(os.environ.get("AIENG_MAX_VIDEO_SCAN_FPS", "30.0"))
+MAX_VIDEO_SCAN_SECONDS = float(os.environ.get("AIENG_MAX_VIDEO_SCAN_SECONDS", "600"))
+MAX_VIDEO_SCAN_SAMPLES = int(os.environ.get("AIENG_MAX_VIDEO_SCAN_SAMPLES", "9000"))
+MAX_RETURNED_VIDEO_FRAMES = int(os.environ.get("AIENG_MAX_RETURNED_VIDEO_FRAMES", "24"))
+VIDEO_JOB_WORKERS = int(os.environ.get("AIENG_VIDEO_JOB_WORKERS", "1"))
+MAX_VIDEO_JOBS = int(os.environ.get("AIENG_MAX_VIDEO_JOBS", "6"))
+VIDEO_JOB_TTL_SECONDS = int(os.environ.get("AIENG_VIDEO_JOB_TTL_SECONDS", "7200"))
+
 
 app = FastAPI(title="AI Facilities YOLO Inference API")
 app.add_middleware(
@@ -53,6 +72,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class VideoJobCancelled(Exception):
+    pass
+
+
+VIDEO_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, VIDEO_JOB_WORKERS), thread_name_prefix="video-scan")
+VIDEO_JOBS: dict[str, dict] = {}
+VIDEO_JOB_LOCK = threading.Lock()
 
 
 def _is_likely_severity_model(path_value: str) -> bool:
@@ -84,20 +112,46 @@ def _model_priority(model_path: Path, kind: str) -> tuple[int, str]:
         if "/stage2_severity/weights/last.pt" in normalized:
             return (3, normalized)
     if kind == "detector":
-        if name == "defect_detector.pt" and "/weights/" in normalized:
+        if "stage1_robust_later_best.pt" in normalized:
             return (0, normalized)
-        if "/stage1_defect_detector/weights/best.pt" in normalized:
+        if "stage1_anchor_robust_curriculum" in normalized and normalized.endswith("/weights/best.pt"):
             return (1, normalized)
-        if normalized.endswith("/weights/best.pt"):
+        if "defect_detector_anchor_balanced_candidate.pt" in normalized:
             return (2, normalized)
-        if normalized.endswith("/best.pt"):
+        if "stage1_robust_epoch39_best.pt" in normalized:
             return (3, normalized)
+        if "stage1_clean_near_done_best.pt" in normalized:
+            return (4, normalized)
+        if name == "defect_detector.pt" and "/weights/" in normalized:
+            return (5, normalized)
+        if "/stage1_defect_detector/weights/best.pt" in normalized:
+            return (6, normalized)
+        if normalized.endswith("/weights/best.pt"):
+            return (7, normalized)
+        if normalized.endswith("/best.pt"):
+            return (8, normalized)
     return (9, normalized)
+
+
+def _model_roots() -> list[Path]:
+    roots = list(MODEL_ROOTS)
+    extra = os.environ.get("AIENG_MODEL_ROOTS", "")
+    for item in extra.split(os.pathsep):
+        if item.strip():
+            roots.append(Path(item.strip()))
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.expanduser().resolve()
+        if resolved not in seen:
+            unique.append(resolved)
+            seen.add(resolved)
+    return unique
 
 
 def _discover_model_paths() -> list[Path]:
     candidates: set[Path] = set()
-    for root in MODEL_ROOTS:
+    for root in _model_roots():
         if not root.exists():
             continue
         if root.is_file() and root.suffix.lower() == ".pt":
@@ -140,6 +194,73 @@ def _device_arg() -> str | None:
         torch.backends.cudnn.benchmark = True
         return "cuda:0"
     return None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _job_public_snapshot(job: dict) -> dict:
+    snapshot = {
+        key: value
+        for key, value in job.items()
+        if key not in {"future", "cancelRequested", "createdMonotonic"}
+    }
+    if job.get("status") == "queued":
+        queued_jobs = sorted(
+            (
+                candidate
+                for candidate in VIDEO_JOBS.values()
+                if candidate.get("status") == "queued"
+            ),
+            key=lambda item: item.get("createdMonotonic", 0.0),
+        )
+        snapshot["queuePosition"] = next(
+            (index + 1 for index, candidate in enumerate(queued_jobs) if candidate.get("id") == job.get("id")),
+            0,
+        )
+    else:
+        snapshot["queuePosition"] = 0
+    return snapshot
+
+
+def _get_job_snapshot(job_id: str) -> dict:
+    with VIDEO_JOB_LOCK:
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Video job not found: {job_id}")
+        return _job_public_snapshot(job)
+
+
+def _update_video_job(job_id: str, **fields) -> None:
+    with VIDEO_JOB_LOCK:
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updatedAt"] = _now_iso()
+
+
+def _video_job_cancel_requested(job_id: str) -> bool:
+    with VIDEO_JOB_LOCK:
+        return bool(VIDEO_JOBS.get(job_id, {}).get("cancelRequested"))
+
+
+def _prune_video_jobs_locked() -> None:
+    now = time.monotonic()
+    removable = []
+    for job_id, job in VIDEO_JOBS.items():
+        status = job.get("status")
+        finished = float(job.get("finishedMonotonic") or 0.0)
+        if status in {"completed", "failed", "cancelled"} and finished and now - finished > VIDEO_JOB_TTL_SECONDS:
+            removable.append(job_id)
+    for job_id in removable:
+        VIDEO_JOBS.pop(job_id, None)
+
+
+def _active_video_job_count_locked() -> int:
+    _prune_video_jobs_locked()
+    return sum(1 for job in VIDEO_JOBS.values() if job.get("status") in {"queued", "running"})
 
 
 def _name_from_result(result, class_id: int) -> str:
@@ -195,14 +316,42 @@ def _priority_for(severity: str, confidence: float, area_ratio: float) -> Litera
     return "Monitor"
 
 
-def _action_for(defect_class: str, severity: str, priority: str) -> str:
+def _action_for(defect_class: str, severity: str, priority: str, confidence: float, area_ratio: float) -> str:
+    defect_key = defect_class.lower().strip()
+    extent = (
+        "large-area"
+        if area_ratio >= 0.12
+        else "moderate-area"
+        if area_ratio >= 0.035
+        else "localized"
+    )
+    confidence_note = "high-confidence" if confidence >= 0.7 else "medium-confidence" if confidence >= 0.4 else "low-confidence"
+    class_guidance = {
+        "crack": "measure crack width/length, photograph both ends, and check whether the crack is active or moisture-stained",
+        "spalling": "tap-test surrounding concrete, remove loose material, and inspect for exposed reinforcement before patch repair",
+        "corrosion": "check water ingress, estimate section loss, clean/passivate the metal surface, and plan protective recoating or replacement",
+        "pothole": "apply traffic control if exposed to vehicles, mark the hazard, and schedule patching with drainage check",
+        "paint_degradation": "check moisture source, scrape unstable coating, repair substrate, and repaint with suitable primer/topcoat",
+    }.get(defect_key, "verify the finding on site, document the location, and assign the appropriate maintenance owner")
+
     if priority == "Immediate":
-        return f"Restrict area if needed and raise urgent maintenance for {defect_class}."
+        return (
+            f"Immediate {extent} {defect_class} response: restrict access if the area is reachable or safety-sensitive, "
+            f"then {class_guidance}. Evidence is {confidence_note}; confirm on site before closing the work order."
+        )
     if severity == "moderate":
-        return f"Schedule detailed inspection and repair planning for {defect_class}."
+        return (
+            f"Planned {extent} {defect_class} repair: {class_guidance}. Use the annotated image as the work-order evidence "
+            f"and compare with the next inspection for progression."
+        )
     if severity == "uncertain":
-        return "Review manually before creating a work order."
-    return f"Log and monitor {defect_class} in the next inspection cycle."
+        return (
+            f"Manual review required for {defect_class}: confidence or severity margin is weak. Recheck with a closer image, "
+            f"then decide whether to log, monitor, or schedule repair."
+        )
+    return (
+        f"Monitor {extent} {defect_class}: log the evidence, {class_guidance}, and recheck during the next inspection cycle."
+    )
 
 
 def _risk_score(detections: list[dict]) -> tuple[float, float]:
@@ -225,6 +374,309 @@ def _decode_upload(payload: bytes) -> np.ndarray:
     return image
 
 
+def _decode_image_or_none(payload: bytes) -> np.ndarray | None:
+    if not payload:
+        return None
+    return cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return "youtube.com" in host or "youtu.be" in host
+
+
+def _google_drive_download_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if "drive.google.com" not in host and "docs.google.com" not in host:
+        return url
+
+    query_id = parse_qs(parsed.query).get("id", [""])[0]
+    if query_id:
+        return f"https://drive.google.com/uc?export=download&id={query_id}"
+
+    match = re.search(r"/(?:file/d|open\?id=|uc\?id=)/?([A-Za-z0-9_-]+)", url)
+    if match:
+        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+
+    match = re.search(r"/d/([A-Za-z0-9_-]+)", url)
+    if match:
+        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+
+    return url
+
+
+def _download_public_url(url: str, max_bytes: int = MAX_URL_BYTES) -> tuple[bytes, str]:
+    request = Request(
+        _google_drive_download_url(url),
+        headers={
+            "User-Agent": "Mozilla/5.0 AIEngGroupProj/1.0",
+            "Accept": "image/*,video/*,application/octet-stream,*/*",
+        },
+    )
+    with urlopen(request, timeout=45) as response:
+        content_type = response.headers.get("content-type", "")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Linked media is larger than the configured {max_bytes // (1024 * 1024)} MB limit.",
+                )
+            chunks.append(chunk)
+    return b"".join(chunks), content_type
+
+
+def _video_duration_seconds(source: str | Path) -> float | None:
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        return None
+    try:
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+        if frame_count > 0 and fps > 0:
+            return frame_count / fps
+        duration_ms = float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0)
+        return duration_ms / 1000.0 if duration_ms > 0 else None
+    finally:
+        capture.release()
+
+
+def _video_scan_times(
+    frame_time_sec: float,
+    scan_fps: float,
+    duration_sec: float | None = None,
+    scan_video: bool = True,
+    max_scan_seconds: float = MAX_VIDEO_SCAN_SECONDS,
+) -> tuple[list[float], bool, float]:
+    start = max(0.0, float(frame_time_sec or 0.0))
+    if not scan_video:
+        return [round(start, 2)], False, 0.0
+
+    fps = max(0.05, min(float(scan_fps or DEFAULT_VIDEO_SCAN_FPS), MAX_VIDEO_SCAN_FPS))
+    interval = 1.0 / fps
+    known_duration = float(duration_sec or 0.0)
+    if known_duration > 0:
+        end = max(start, known_duration)
+    else:
+        end = start + max_scan_seconds
+    if max_scan_seconds > 0:
+        end = min(end, start + max_scan_seconds)
+    coverage_seconds = max(0.0, end - start)
+    estimated_samples = int(np.floor(coverage_seconds / interval)) + 1
+    safety_capped = estimated_samples > MAX_VIDEO_SCAN_SAMPLES
+    sample_count = max(1, min(estimated_samples, MAX_VIDEO_SCAN_SAMPLES))
+    times = [round(start + (index * interval), 2) for index in range(sample_count)]
+    if known_duration > 0:
+        times = [value for value in times if value <= known_duration + 0.25]
+    return times or [round(start, 2)], safety_capped, coverage_seconds
+
+
+def _sample_video_frames_from_source(
+    source: str | Path,
+    frame_time_sec: float,
+    scan_fps: float,
+    scan_video: bool = True,
+    duration_sec: float | None = None,
+    allow_empty: bool = False,
+) -> list[dict]:
+    duration = duration_sec if duration_sec and duration_sec > 0 else _video_duration_seconds(source)
+    times, safety_capped, coverage_seconds = _video_scan_times(frame_time_sec, scan_fps, duration, scan_video)
+    frames: list[dict] = []
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        if not allow_empty:
+            raise HTTPException(status_code=400, detail="Linked media is not a readable video.")
+        return frames
+    try:
+        for seconds in times:
+            if seconds > 0:
+                capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                continue
+            frames.append(
+                {
+                    "frameTimeSec": seconds,
+                    "image": frame,
+                    "mediaKind": "video",
+                    "scanFps": scan_fps,
+                    "safetyCapped": safety_capped,
+                    "coverageSeconds": round(coverage_seconds, 2),
+                }
+            )
+    finally:
+        capture.release()
+
+    if not frames:
+        capture = cv2.VideoCapture(str(source))
+        try:
+            if capture.isOpened():
+                ok, frame = capture.read()
+                if ok and frame is not None:
+                    frames.append(
+                        {
+                            "frameTimeSec": max(0.0, frame_time_sec),
+                            "image": frame,
+                            "mediaKind": "video",
+                            "scanFps": scan_fps,
+                            "safetyCapped": safety_capped,
+                            "coverageSeconds": round(coverage_seconds, 2),
+                        }
+                    )
+        finally:
+            capture.release()
+
+    if not frames and not allow_empty:
+        raise HTTPException(status_code=400, detail="Could not extract usable video frames from the linked media.")
+    return frames
+
+
+def _frames_from_video_file(
+    video_path: Path,
+    seconds: float,
+    scan_fps: float = DEFAULT_VIDEO_SCAN_FPS,
+    scan_video: bool = False,
+) -> list[dict]:
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            raise HTTPException(status_code=400, detail="Linked media is not a readable video.")
+    finally:
+        capture.release()
+    return _sample_video_frames_from_source(video_path, seconds, scan_fps, scan_video)
+
+
+def _frame_from_video_file(video_path: Path, seconds: float) -> np.ndarray:
+    return _frames_from_video_file(video_path, seconds, scan_video=False)[0]["image"]
+
+
+def _youtube_info(url: str) -> dict:
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="YouTube links require yt-dlp. Install requirements.txt or run: pip install yt-dlp",
+        ) from exc
+
+    options = {
+        "quiet": True,
+        "skip_download": True,
+        "format": "best[ext=mp4]/best",
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(options) as downloader:
+        return downloader.extract_info(url, download=False)
+
+
+def _youtube_direct_url(info: dict) -> str:
+    direct_url = info.get("url")
+    if not direct_url:
+        formats = info.get("formats") or []
+        mp4_formats = [item for item in formats if item.get("url") and item.get("ext") == "mp4"]
+        if mp4_formats:
+            direct_url = sorted(mp4_formats, key=lambda item: item.get("height") or 0)[-1]["url"]
+    return str(direct_url or "")
+
+
+def _frames_from_youtube_url(
+    url: str,
+    seconds: float,
+    scan_fps: float = DEFAULT_VIDEO_SCAN_FPS,
+    scan_video: bool = False,
+) -> list[dict]:
+    info = _youtube_info(url)
+    direct_url = _youtube_direct_url(info)
+    if direct_url:
+        frames = _sample_video_frames_from_source(
+            direct_url,
+            seconds,
+            scan_fps,
+            scan_video,
+            duration_sec=float(info.get("duration") or 0) or None,
+            allow_empty=True,
+        )
+        if frames:
+            return [{**item, "mediaKind": "youtube"} for item in frames]
+
+    thumbnail = info.get("thumbnail")
+    if thumbnail:
+        payload, _ = _download_public_url(thumbnail, max_bytes=12 * 1024 * 1024)
+        image = _decode_image_or_none(payload)
+        if image is not None:
+            return [{"frameTimeSec": max(0.0, seconds), "image": image, "mediaKind": "youtube_thumbnail"}]
+
+    raise HTTPException(status_code=400, detail="Could not extract a frame from the YouTube link.")
+
+
+def _frame_from_youtube_url(url: str, seconds: float) -> np.ndarray:
+    return _frames_from_youtube_url(url, seconds, scan_video=False)[0]["image"]
+
+
+def _frames_from_media_url(
+    url: str,
+    seconds: float,
+    scan_fps: float = DEFAULT_VIDEO_SCAN_FPS,
+    scan_video: bool = False,
+) -> list[dict]:
+    if _is_youtube_url(url):
+        return _frames_from_youtube_url(url, seconds, scan_fps, scan_video)
+
+    payload, content_type = _download_public_url(url)
+    image = _decode_image_or_none(payload)
+    if image is not None:
+        return [{"frameTimeSec": max(0.0, seconds), "image": image, "mediaKind": "image"}]
+
+    suffix = ".mp4"
+    if "webm" in content_type:
+        suffix = ".webm"
+    elif "quicktime" in content_type or "mov" in content_type:
+        suffix = ".mov"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        temp_path = Path(handle.name)
+        handle.write(payload)
+    try:
+        return _frames_from_video_file(temp_path, seconds, scan_fps, scan_video)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _frame_from_media_url(url: str, seconds: float) -> np.ndarray:
+    return _frames_from_media_url(url, seconds, 1)[0]["image"]
+
+
+def _video_result_score(result: dict) -> float:
+    detections = result.get("detections") or []
+    if not detections:
+        return 0.0
+    score = float(len(detections)) * 10.0
+    for detection in detections:
+        severity = str(detection.get("severity", "unknown"))
+        score += float(detection.get("confidence") or 0.0) * 4.0
+        score += SEVERITY_WEIGHTS.get(severity, 1.0)
+        score += min(float(detection.get("areaRatio") or 0.0) * 10.0, 2.5)
+    return score
+
+
+def _summarize_sample(result: dict, frame_time_sec: float, confidence: float) -> dict:
+    detections = result.get("detections") or []
+    max_confidence = max((float(item.get("confidence") or 0.0) for item in detections), default=0.0)
+    classes = sorted({str(item.get("className", "unknown")) for item in detections})
+    return {
+        "frameTimeSec": round(float(frame_time_sec), 2),
+        "detections": len(detections),
+        "maxConfidence": round(max_confidence, 4),
+        "classes": classes,
+        "confidence": round(float(confidence), 3),
+    }
+
+
 def _encode_jpeg_data_url(image_bgr: np.ndarray) -> str:
     ok, buffer = cv2.imencode(".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     if not ok:
@@ -243,12 +695,29 @@ def _draw_label(image: np.ndarray, x1: int, y1: int, label: str, color: tuple[in
     cv2.putText(image, label, (x1 + 6, top + text_height + 3), font, scale, (8, 12, 18), thickness, cv2.LINE_AA)
 
 
+def _bbox_iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = float(area_a + area_b - inter_area)
+    return inter_area / union if union > 0 else 0.0
+
+
 def _run_inference(
     image_bgr: np.ndarray,
     detector_path: str,
     severity_path: str,
     confidence: float,
     iou: float,
+    include_image: bool = True,
 ) -> dict:
     resolved_detector_path = _resolve_model_path(detector_path)
     resolved_severity_path = _resolve_model_path(severity_path)
@@ -264,7 +733,7 @@ def _run_inference(
         iou=iou,
         imgsz=640,
         max_det=120,
-        agnostic_nms=True,
+        agnostic_nms=False,
         device=_device_arg(),
         verbose=False,
     )
@@ -280,7 +749,9 @@ def _run_inference(
             xyxy = boxes.xyxy.cpu().numpy()
             class_ids = boxes.cls.cpu().numpy().astype(int)
             confidences = boxes.conf.cpu().numpy()
-            for index, coords in enumerate(xyxy):
+            kept_boxes: list[tuple[tuple[int, int, int, int], int]] = []
+            for index in sorted(range(len(xyxy)), key=lambda item: float(confidences[item]), reverse=True):
+                coords = xyxy[index]
                 x1, y1, x2, y2 = coords.astype(int).tolist()
                 x1 = max(0, min(width - 1, x1))
                 y1 = max(0, min(height - 1, y1))
@@ -288,13 +759,18 @@ def _run_inference(
                 y2 = max(0, min(height, y2))
                 if x2 <= x1 or y2 <= y1:
                     continue
+                class_id = int(class_ids[index])
+                box_tuple = (x1, y1, x2, y2)
+                if any(existing_class == class_id and _bbox_iou(existing_box, box_tuple) >= 0.88 for existing_box, existing_class in kept_boxes):
+                    continue
+                kept_boxes.append((box_tuple, class_id))
 
                 crop = image_bgr[y1:y2, x1:x2]
                 stage2_started = time.perf_counter()
                 severity, severity_conf = _classify_severity(severity_model, crop)
                 stage2_latency_ms += (time.perf_counter() - stage2_started) * 1000.0
                 defect_conf = float(confidences[index])
-                defect_class = _name_from_result(result, int(class_ids[index]))
+                defect_class = _name_from_result(result, class_id)
                 area_ratio = ((x2 - x1) * (y2 - y1)) / float(width * height)
                 priority = _priority_for(severity, defect_conf, area_ratio)
                 color = COLORS_BGR.get(severity, COLORS_BGR["unknown"])
@@ -310,7 +786,7 @@ def _run_inference(
                         "severity": severity,
                         "severityConfidence": round(severity_conf, 4),
                         "priority": priority,
-                        "action": _action_for(defect_class, severity, priority),
+                        "action": _action_for(defect_class, severity, priority, defect_conf, area_ratio),
                         "bbox": {
                             "x": round(x1 / width, 6),
                             "y": round(y1 / height, 6),
@@ -323,7 +799,7 @@ def _run_inference(
 
     risk, condition = _risk_score(detections)
     latency_ms = (time.perf_counter() - started) * 1000.0
-    return {
+    payload = {
         "detections": detections,
         "latencyMs": round(latency_ms, 2),
         "stageMetrics": {
@@ -335,8 +811,269 @@ def _run_inference(
         },
         "conditionIndex": condition,
         "riskScore": risk,
-        "annotatedImage": _encode_jpeg_data_url(annotated),
     }
+    if include_image:
+        payload["evidenceImage"] = _encode_jpeg_data_url(image_bgr)
+        payload["annotatedImage"] = _encode_jpeg_data_url(annotated)
+    return payload
+
+
+def _analyze_media_url(
+    media_url: str,
+    detector_path: str,
+    severity_path: str,
+    confidence: float = 0.45,
+    iou: float = 0.45,
+    frame_time_sec: float = 0.0,
+    scan_video: bool = True,
+    scan_fps: float = DEFAULT_VIDEO_SCAN_FPS,
+    review_confidence: float = 0.18,
+    progress_callback=None,
+    cancel_requested=None,
+) -> dict:
+    if not media_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Media URL must start with http:// or https://.")
+
+    def update_progress(**fields) -> None:
+        if progress_callback:
+            progress_callback(**fields)
+
+    def check_cancelled() -> None:
+        if cancel_requested and cancel_requested():
+            raise VideoJobCancelled()
+
+    scan_started = time.perf_counter()
+    requested_confidence = max(0.01, min(float(confidence), 0.99))
+    review_confidence = max(0.01, min(float(review_confidence), requested_confidence))
+    requested_frame_time = max(0.0, frame_time_sec)
+    requested_scan_fps = max(0.05, min(float(scan_fps or DEFAULT_VIDEO_SCAN_FPS), MAX_VIDEO_SCAN_FPS))
+
+    update_progress(progress=2, stage="resolving", message="Resolving linked media and preparing frame sampling.")
+    check_cancelled()
+    frames = _frames_from_media_url(media_url, requested_frame_time, requested_scan_fps, scan_video)
+    total_frames = max(1, len(frames))
+    update_progress(
+        progress=8,
+        stage="queued_frames",
+        message=f"Prepared {total_frames} sampled frame{'s' if total_frames != 1 else ''}.",
+        totalFrames=total_frames,
+        processedFrames=0,
+        positiveFrames=0,
+    )
+
+    best_result: dict | None = None
+    best_frame: dict | None = None
+    best_confidence = requested_confidence
+    sampled_frames: list[dict] = []
+    positive_frame_candidates: list[dict] = []
+    confidence_passes = [requested_confidence]
+    if review_confidence < requested_confidence:
+        confidence_passes.append(review_confidence)
+
+    for pass_index, pass_confidence in enumerate(confidence_passes):
+        pass_samples: list[dict] = []
+        pass_positive_candidates: list[dict] = []
+        pass_label = "requested" if pass_index == 0 else "review"
+        for frame_index, frame in enumerate(frames):
+            check_cancelled()
+            result = _run_inference(
+                frame["image"],
+                detector_path,
+                severity_path,
+                pass_confidence,
+                iou,
+                include_image=False,
+            )
+            sample = _summarize_sample(result, frame["frameTimeSec"], pass_confidence)
+            pass_samples.append(sample)
+            score = _video_result_score(result)
+            if result.get("detections"):
+                pass_positive_candidates.append(
+                    {
+                        "score": score,
+                        "frame": frame,
+                        "confidence": pass_confidence,
+                        "sample": sample,
+                    }
+                )
+            if best_result is None or score > _video_result_score(best_result):
+                best_result = result
+                best_frame = frame
+                best_confidence = pass_confidence
+
+            processed = frame_index + 1
+            progress = min(84, 10 + round((processed / total_frames) * 68))
+            update_progress(
+                progress=progress,
+                stage="scanning",
+                message=f"Scanning frame {processed}/{total_frames} with {pass_label} sensitivity.",
+                totalFrames=total_frames,
+                processedFrames=processed,
+                positiveFrames=len(pass_positive_candidates),
+                currentFrameTimeSec=round(float(frame["frameTimeSec"]), 2),
+                usedConfidence=round(pass_confidence, 3),
+            )
+
+        sampled_frames = pass_samples
+        positive_frame_candidates = pass_positive_candidates
+        if pass_positive_candidates:
+            break
+
+    if best_result is None or best_frame is None:
+        raise HTTPException(status_code=400, detail="No usable media frame could be analyzed.")
+
+    check_cancelled()
+    update_progress(
+        progress=88,
+        stage="rendering_evidence",
+        message="Rendering selected evidence and defect-frame snapshots.",
+        positiveFrames=len(positive_frame_candidates),
+    )
+    render_confidence = min(best_confidence, review_confidence)
+    result = _run_inference(best_frame["image"], detector_path, severity_path, render_confidence, iou)
+    detected_frames = []
+    returned_candidates = sorted(
+        sorted(positive_frame_candidates, key=lambda candidate: candidate["frame"]["frameTimeSec"]),
+        key=lambda candidate: candidate["score"],
+        reverse=True,
+    )[:MAX_RETURNED_VIDEO_FRAMES]
+    returned_candidates.sort(key=lambda candidate: candidate["frame"]["frameTimeSec"])
+    for index, candidate in enumerate(returned_candidates):
+        check_cancelled()
+        frame = candidate["frame"]
+        frame_render_confidence = min(float(candidate["confidence"]), review_confidence)
+        frame_result = _run_inference(
+            frame["image"],
+            detector_path,
+            severity_path,
+            frame_render_confidence,
+            iou,
+            include_image=True,
+        )
+        rendered_sample = _summarize_sample(frame_result, frame["frameTimeSec"], frame_render_confidence)
+        detected_frames.append(
+            {
+                **rendered_sample,
+                "id": f"frame-{index}-{round(float(frame['frameTimeSec']), 2)}",
+                "evidenceImage": frame_result.get("evidenceImage"),
+                "annotatedImage": frame_result.get("annotatedImage"),
+                "detectionItems": frame_result.get("detections", []),
+                "conditionIndex": frame_result.get("conditionIndex"),
+                "riskScore": frame_result.get("riskScore"),
+            }
+        )
+        update_progress(
+            progress=min(96, 88 + round(((index + 1) / max(1, len(returned_candidates))) * 8)),
+            stage="rendering_evidence",
+            message=f"Rendering defect frame {index + 1}/{max(1, len(returned_candidates))}.",
+            returnedDefectFrames=len(detected_frames),
+        )
+
+    result["latencyMs"] = round((time.perf_counter() - scan_started) * 1000.0, 2)
+    result["stageMetrics"]["videoScanLatencyMs"] = result["latencyMs"]
+    result["stageMetrics"]["sampledFrames"] = len(frames)
+    result["stageMetrics"]["scanFps"] = round(requested_scan_fps, 3)
+    result["stageMetrics"]["usedConfidence"] = round(render_confidence, 3)
+    result["source"] = {
+        "kind": "url",
+        "mediaKind": best_frame.get("mediaKind", "unknown"),
+        "frameTimeSec": requested_frame_time,
+        "selectedFrameTimeSec": round(float(best_frame["frameTimeSec"]), 2),
+        "sampleCount": len(frames),
+        "scanFps": round(requested_scan_fps, 3),
+        "coverageSeconds": best_frame.get("coverageSeconds"),
+        "safetyCapped": bool(best_frame.get("safetyCapped", False)),
+        "sampledFrames": sampled_frames,
+        "detectedFrames": detected_frames,
+        "positiveFrameCount": len(positive_frame_candidates),
+        "returnedDefectFrames": len(detected_frames),
+        "requestedConfidence": round(requested_confidence, 3),
+        "rankingConfidence": round(best_confidence, 3),
+        "usedConfidence": round(render_confidence, 3),
+        "reviewMode": render_confidence < requested_confidence,
+        "youtube": _is_youtube_url(media_url),
+        "googleDrive": "drive.google.com" in urlparse(media_url).netloc.lower(),
+    }
+    update_progress(progress=100, stage="completed", message="Video analysis completed.")
+    return result
+
+
+def _run_video_job(job_id: str, params: dict) -> None:
+    if _video_job_cancel_requested(job_id):
+        _update_video_job(
+            job_id,
+            status="cancelled",
+            progress=0,
+            stage="cancelled",
+            message="Video analysis was cancelled before it started.",
+            finishedAt=_now_iso(),
+            finishedMonotonic=time.monotonic(),
+        )
+        return
+
+    _update_video_job(
+        job_id,
+        status="running",
+        startedAt=_now_iso(),
+        progress=1,
+        stage="starting",
+        message="Video analysis worker started.",
+    )
+    try:
+        result = _analyze_media_url(
+            **params,
+            progress_callback=lambda **fields: _update_video_job(job_id, **fields),
+            cancel_requested=lambda: _video_job_cancel_requested(job_id),
+        )
+    except VideoJobCancelled:
+        _update_video_job(
+            job_id,
+            status="cancelled",
+            progress=0,
+            stage="cancelled",
+            message="Video analysis was cancelled.",
+            finishedAt=_now_iso(),
+            finishedMonotonic=time.monotonic(),
+        )
+        return
+    except HTTPException as exc:
+        _update_video_job(
+            job_id,
+            status="failed",
+            progress=0,
+            stage="failed",
+            message=str(exc.detail),
+            error=str(exc.detail),
+            finishedAt=_now_iso(),
+            finishedMonotonic=time.monotonic(),
+        )
+        return
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        _update_video_job(
+            job_id,
+            status="failed",
+            progress=0,
+            stage="failed",
+            message=str(exc),
+            error=str(exc),
+            finishedAt=_now_iso(),
+            finishedMonotonic=time.monotonic(),
+        )
+        return
+
+    _update_video_job(
+        job_id,
+        status="completed",
+        progress=100,
+        stage="completed",
+        message="Video analysis completed.",
+        result=result,
+        finishedAt=_now_iso(),
+        finishedMonotonic=time.monotonic(),
+        totalFrames=result.get("source", {}).get("sampleCount"),
+        positiveFrames=result.get("source", {}).get("positiveFrameCount"),
+        returnedDefectFrames=result.get("source", {}).get("returnedDefectFrames"),
+    )
 
 
 @app.get("/health")
@@ -388,3 +1125,126 @@ async def infer_image(
     payload = await file.read()
     image = _decode_upload(payload)
     return _run_inference(image, detector_path, severity_path, confidence, iou)
+
+
+@app.post("/api/infer/url")
+async def infer_url(
+    media_url: str = Form(...),
+    detector_path: str = Form(...),
+    severity_path: str = Form(...),
+    confidence: float = Form(0.45),
+    iou: float = Form(0.45),
+    frame_time_sec: float = Form(0.0),
+    scan_video: bool = Form(True),
+    scan_fps: float = Form(DEFAULT_VIDEO_SCAN_FPS),
+    review_confidence: float = Form(0.18),
+) -> dict:
+    return _analyze_media_url(
+        media_url=media_url,
+        detector_path=detector_path,
+        severity_path=severity_path,
+        confidence=confidence,
+        iou=iou,
+        frame_time_sec=frame_time_sec,
+        scan_video=scan_video,
+        scan_fps=scan_fps,
+        review_confidence=review_confidence,
+    )
+
+
+@app.post("/api/jobs/video")
+async def submit_video_job(
+    media_url: str = Form(...),
+    detector_path: str = Form(...),
+    severity_path: str = Form(...),
+    confidence: float = Form(0.45),
+    iou: float = Form(0.45),
+    frame_time_sec: float = Form(0.0),
+    scan_video: bool = Form(True),
+    scan_fps: float = Form(DEFAULT_VIDEO_SCAN_FPS),
+    review_confidence: float = Form(0.18),
+) -> dict:
+    if not media_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Media URL must start with http:// or https://.")
+    _resolve_model_path(detector_path)
+    _resolve_model_path(severity_path)
+
+    with VIDEO_JOB_LOCK:
+        if _active_video_job_count_locked() >= MAX_VIDEO_JOBS:
+            raise HTTPException(status_code=429, detail=f"Video queue is full. Maximum active jobs: {MAX_VIDEO_JOBS}.")
+
+        job_id = str(uuid.uuid4())
+        params = {
+            "media_url": media_url,
+            "detector_path": detector_path,
+            "severity_path": severity_path,
+            "confidence": confidence,
+            "iou": iou,
+            "frame_time_sec": frame_time_sec,
+            "scan_video": scan_video,
+            "scan_fps": scan_fps,
+            "review_confidence": review_confidence,
+        }
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "stage": "queued",
+            "message": "Video analysis queued.",
+            "mediaUrl": media_url,
+            "createdAt": _now_iso(),
+            "updatedAt": _now_iso(),
+            "createdMonotonic": time.monotonic(),
+            "totalFrames": None,
+            "processedFrames": 0,
+            "positiveFrames": 0,
+            "returnedDefectFrames": 0,
+            "scanFps": round(max(0.05, min(float(scan_fps or DEFAULT_VIDEO_SCAN_FPS), MAX_VIDEO_SCAN_FPS)), 3),
+            "cancelRequested": False,
+        }
+        VIDEO_JOBS[job_id] = job
+        future = VIDEO_JOB_EXECUTOR.submit(_run_video_job, job_id, params)
+        job["future"] = future
+        return _job_public_snapshot(job)
+
+
+@app.get("/api/jobs")
+def list_jobs() -> dict:
+    with VIDEO_JOB_LOCK:
+        _prune_video_jobs_locked()
+        jobs = sorted(VIDEO_JOBS.values(), key=lambda item: item.get("createdMonotonic", 0.0), reverse=True)
+        return {"jobs": [_job_public_snapshot(job) for job in jobs]}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_video_job(job_id: str) -> dict:
+    return _get_job_snapshot(job_id)
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_video_job(job_id: str) -> dict:
+    with VIDEO_JOB_LOCK:
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Video job not found: {job_id}")
+        if job.get("status") in {"completed", "failed", "cancelled"}:
+            return _job_public_snapshot(job)
+
+        job["cancelRequested"] = True
+        future = job.get("future")
+        if job.get("status") == "queued" and future is not None and future.cancel():
+            job.update(
+                {
+                    "status": "cancelled",
+                    "progress": 0,
+                    "stage": "cancelled",
+                    "message": "Video analysis was cancelled while queued.",
+                    "finishedAt": _now_iso(),
+                    "finishedMonotonic": time.monotonic(),
+                    "updatedAt": _now_iso(),
+                }
+            )
+        else:
+            job["message"] = "Cancellation requested. The running frame will finish before the job stops."
+            job["updatedAt"] = _now_iso()
+        return _job_public_snapshot(job)

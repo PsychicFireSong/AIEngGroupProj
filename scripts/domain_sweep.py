@@ -6,7 +6,7 @@ import json
 import time
 from collections import Counter
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import cv2
 import numpy as np
@@ -46,7 +46,34 @@ def filename_from_url(url: str, fallback: str) -> str:
     return name
 
 
-def ensure_image(row: dict, image_dir: Path) -> Path:
+def wikimedia_thumbnail_url(url: str, width: int = 1280) -> str:
+    """Use Wikimedia's thumbnail redirect to avoid repeatedly requesting full-size originals."""
+    parsed = urlparse(url)
+    if "wikimedia.org" not in parsed.netloc.lower():
+        return url
+    marker = "/wiki/Special:FilePath/"
+    if marker not in parsed.path:
+        return url
+    filename = unquote(parsed.path.split(marker, 1)[1])
+    if not filename:
+        return url
+    return f"https://commons.wikimedia.org/wiki/Special:Redirect/file/{quote(filename, safe='')}?width={width}"
+
+
+def download_candidates(url: str) -> list[str]:
+    thumbnail_url = wikimedia_thumbnail_url(url)
+    candidates = [thumbnail_url, url] if thumbnail_url != url else [url]
+    return list(dict.fromkeys(candidates))
+
+
+def valid_image_bytes(content: bytes) -> bool:
+    if not content:
+        return False
+    array = np.frombuffer(content, dtype=np.uint8)
+    return cv2.imdecode(array, cv2.IMREAD_COLOR) is not None
+
+
+def ensure_image(row: dict, image_dir: Path, cache_dir: Path | None = None) -> Path:
     local_path = row.get("local_path", "").strip()
     if local_path:
         path = Path(local_path)
@@ -59,32 +86,54 @@ def ensure_image(row: dict, image_dir: Path) -> Path:
         raise ValueError(f"No local_path or image_url configured for {row['id']}")
 
     image_dir.mkdir(parents=True, exist_ok=True)
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     output_path = image_dir / f"{safe_name(row['id'])}_{filename_from_url(image_url, row['id'])}"
+    cache_path = (cache_dir / output_path.name) if cache_dir is not None else None
     if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+    if cache_path is not None and cache_path.exists() and cache_path.stat().st_size > 0:
+        output_path.write_bytes(cache_path.read_bytes())
         return output_path
 
     last_error: Exception | None = None
-    for attempt in range(5):
-        try:
-            response = requests.get(
-                image_url,
-                timeout=60,
-                headers={"User-Agent": "AIEngGroupProj domain sweep/1.0"},
-                allow_redirects=True,
-            )
-            response.raise_for_status()
-            output_path.write_bytes(response.content)
-            time.sleep(1.0)
-            return output_path
-        except requests.HTTPError as exc:
-            last_error = exc
-            status_code = exc.response.status_code if exc.response is not None else None
-            if status_code not in {429, 500, 502, 503, 504}:
-                raise
-            time.sleep(3.0 * (attempt + 1))
-        except requests.RequestException as exc:
-            last_error = exc
-            time.sleep(3.0 * (attempt + 1))
+    headers = {
+        "User-Agent": "AIEngGroupProj-domain-sweep/1.1 (student evaluation; cached; contact: local-notebook)",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    for candidate_url in download_candidates(image_url):
+        for attempt in range(5):
+            try:
+                response = requests.get(
+                    candidate_url,
+                    timeout=60,
+                    headers=headers,
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+                if not valid_image_bytes(response.content):
+                    raise RuntimeError(f"Downloaded content is not a readable image: {candidate_url}")
+                output_path.write_bytes(response.content)
+                if cache_path is not None:
+                    cache_path.write_bytes(response.content)
+                time.sleep(2.0)
+                return output_path
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code not in {429, 500, 502, 503, 504}:
+                    raise
+                retry_after = 0
+                if exc.response is not None:
+                    try:
+                        retry_after = int(exc.response.headers.get("Retry-After", "0"))
+                    except ValueError:
+                        retry_after = 0
+                sleep_seconds = max(retry_after, min(90, 8 * (2**attempt)))
+                time.sleep(sleep_seconds)
+            except (requests.RequestException, RuntimeError) as exc:
+                last_error = exc
+                time.sleep(min(60, 6 * (attempt + 1)))
     if last_error is not None:
         raise last_error
     return output_path
@@ -217,6 +266,7 @@ def main() -> None:
     parser.add_argument("--detector", default="weights/defect_detector.pt")
     parser.add_argument("--severity", default="weights/severity_cls.pt")
     parser.add_argument("--output", default="output/domain_sweep")
+    parser.add_argument("--image-cache", default="", help="Optional shared cache directory for downloaded sweep images.")
     parser.add_argument("--thresholds", default="0.45,0.30,0.20,0.10")
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument("--annotate-conf", type=float, default=0.20)
@@ -224,6 +274,7 @@ def main() -> None:
 
     output_dir = Path(args.output)
     image_dir = output_dir / "images"
+    cache_dir = Path(args.image_cache) if args.image_cache else None
     annotation_dir = output_dir / "annotated"
     output_dir.mkdir(parents=True, exist_ok=True)
     annotation_dir.mkdir(parents=True, exist_ok=True)
@@ -240,7 +291,7 @@ def main() -> None:
 
     for row in rows:
         try:
-            image_path = ensure_image(row, image_dir)
+            image_path = ensure_image(row, image_dir, cache_dir)
         except Exception as exc:
             result_rows.append(
                 {
@@ -322,6 +373,13 @@ def main() -> None:
         "thresholds": thresholds,
         "primary_threshold": args.annotate_conf,
         "rows": len(rows),
+        "result_rows": len(result_rows),
+        "primary_threshold_rows": sum(
+            1
+            for row in result_rows
+            if str(row.get("threshold", "")) and abs(float(row["threshold"]) - args.annotate_conf) < 1e-9
+        ),
+        "skipped_rows": sum(1 for row in result_rows if row.get("match") == "skipped"),
         "domain_summary_at_primary_threshold": summarize_rows(result_rows, args.annotate_conf),
         "summary_csv": str(result_path),
         "detections_csv": str(detail_path),

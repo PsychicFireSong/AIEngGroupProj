@@ -139,6 +139,46 @@ def collect_samples(dataset: dict, config: dict, synonym_map: dict[str, str], er
     return samples
 
 
+def dataset_metadata(dataset: dict) -> dict:
+    root = resolve_dataset_root(dataset)
+    data_path = root / "data.yaml"
+    names: list[str] = []
+    if data_path.exists():
+        names = read_names(load_yaml(data_path))
+
+    image_counts = {}
+    label_file_counts = {}
+    for source_split in SOURCE_TO_OUTPUT_SPLIT:
+        images_dir = root / source_split / "images"
+        labels_dir = root / source_split / "labels"
+        image_counts[source_split] = len([path for path in images_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTS]) if images_dir.exists() else 0
+        label_file_counts[source_split] = len(list(labels_dir.glob("*.txt"))) if labels_dir.exists() else 0
+
+    return {
+        "name": dataset.get("name", root.name),
+        "path": str(root),
+        "class_names": names,
+        "source_image_files": image_counts,
+        "source_label_files": label_file_counts,
+    }
+
+
+def summarize_samples(samples: list[dict], classes: list[str]) -> dict:
+    split_counts = Counter()
+    label_counts = Counter({name: 0 for name in classes})
+    for sample in samples:
+        split_counts[sample["output_split"]] += 1
+        for line in sample["labels"]:
+            class_id = int(line.split()[0])
+            if 0 <= class_id < len(classes):
+                label_counts[classes[class_id]] += 1
+    return {
+        "mapped_images": len(samples),
+        "mapped_images_by_split": dict(split_counts),
+        "mapped_labels": dict(label_counts),
+    }
+
+
 def split_samples(samples: list[dict], split_cfg: dict, seed: int) -> dict[str, list[dict]]:
     if not samples:
         return {"train": [], "val": [], "test": []}
@@ -240,9 +280,13 @@ def main() -> None:
     synonym_map = build_synonym_map(config)
     errors: Counter = Counter()
     all_samples: list[dict] = []
+    source_audit: list[dict] = []
 
     for dataset in config.get("datasets", []):
+        audit = dataset_metadata(dataset)
         samples = collect_samples(dataset, config, synonym_map, errors)
+        audit.update(summarize_samples(samples, config["classes"]))
+        source_audit.append(audit)
         all_samples.extend(samples)
 
     if args.preserve_splits:
@@ -258,6 +302,7 @@ def main() -> None:
         "total_images": sum(len(items) for items in samples_by_split.values()),
         "images_by_split": {split: len(items) for split, items in samples_by_split.items()},
         "counts": counts,
+        "source_audit": source_audit,
         "mapping_warnings": dict(errors),
     }
     (output_dir / "merge_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

@@ -37,6 +37,23 @@ synonyms:
     - 7_cr
     - tile crack
     - crazing
+    - fessura
+    - fessura diagonale
+    - fessura orizzontale
+    - fessura verticale
+    - wall crack
+    - wall cracks
+    - concrete crack
+    - concrete cracks
+    - wall concrete cracks
+    - horizontal crack
+    - vertical crack
+    - diagonal crack
+    - stairstep crack
+    - stair step crack
+    - stair step
+    - minor crack
+    - major crack
   spalling:
     - spalling
     - spallingw
@@ -44,26 +61,75 @@ synonyms:
     - 6-spalling
     - exposed reinforcement
     - exposed_reinforcement
+    - exposed rebar
+    - exposed reinforcements
+    - exposed iron
+    - esposizione ferri
+    - esposizione_ferri
     - rebar
     - scaling
+    - delamination
+    - delaminazione
+    - honeycombing
+    - vespai
   corrosion:
     - corrosion
     - rust
+    - rusted
     - rust stain
     - ruststrain
+    - metal corrosion
+    - pitting
     - 4-corrosion
     - pitted surface
     - rolled-in scale
+    - rolled in scale
   pothole:
     - pothole
     - potholes
+    - pot hole
+    - pot holes
+    - road pothole
+    - marked pothole
+    - asphalt pothole
   paint_degradation:
+    - abrasione
+    - peeling
     - peeling paint
+    - paint degradation
+    - paint defect
+    - paint defects
+    - paint_defect
+    - peeling_paint
+    - flaking
+    - flaking paint
+    - flaking plaster
     - paint drips
     - pin holes
     - rough and patchy surface
     - stain marks
     - trowels marks
+    - efflorescence
+    - efflorescenza
+    - moisture marks
+    - tracce umidita
+    - tracce_umidita
+    - damp
+    - dampness
+    - dampness with fungus
+    - water seepage
+    - waterseepage
+    - water leakage
+    - water leak
+    - seepage
+    - moisture
+    - moisture damage
     - patches
     - scratches
     - inclusion
+    - dirt
+    - dirt algae and mold
+    - dirt mold
+    - dirty mold
+    - mold
+    - fungus

@@ -25,8 +25,171 @@ body {
   font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
 }
 
+html,
+body {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+* {
+  min-width: 0;
+}
+
 button,
 select,
 input {
   font: inherit;
+}
+
+.dashboard-shell {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--panel-strong), transparent 28%) 0%, transparent 22rem),
+    var(--app-bg);
+  color: var(--app-text);
+}
+
+.enterprise-shell {
+  letter-spacing: 0;
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+.enterprise-shell [class*="rounded-lg"],
+.enterprise-shell [class*="rounded-md"] {
+  border-radius: 2px !important;
+}
+
+.enterprise-sidebar {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--panel-strong), black 20%), var(--rail));
+}
+
+.enterprise-header {
+  box-shadow: inset 0 -1px 0 var(--line);
+}
+
+.enterprise-panel {
+  position: relative;
+  background-color: var(--panel) !important;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03), 0 18px 40px rgba(0, 0, 0, 0.18);
+}
+
+.enterprise-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(180deg, var(--accent), var(--secondary));
+  opacity: 0.72;
+}
+
+.visual-console::before {
+  width: 4px;
+  opacity: 1;
+}
+
+.facility-kpi {
+  min-height: 110px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--panel-soft), transparent 12%), var(--panel)) !important;
+  box-shadow: inset 0 3px 0 var(--accent-border);
+}
+
+.monitor-fit .enterprise-header {
+  padding: 0.75rem 1rem !important;
+}
+
+.monitor-fit .enterprise-header > div {
+  gap: 0.5rem !important;
+}
+
+.monitor-fit .enterprise-header h1 {
+  font-size: 1.5rem !important;
+  line-height: 1.15 !important;
+}
+
+.monitor-fit .enterprise-header p {
+  margin-top: 0.125rem !important;
+}
+
+.monitor-fit .enterprise-header button,
+.monitor-fit .enterprise-header select,
+.monitor-fit .enterprise-header a {
+  height: 2.25rem !important;
+  min-height: 2.25rem !important;
+}
+
+.monitor-fit .enterprise-header button,
+.monitor-fit .enterprise-header a {
+  padding-left: 0.75rem !important;
+  padding-right: 0.75rem !important;
+}
+
+.monitor-fit .enterprise-header .relative svg {
+  top: 0.65rem !important;
+}
+
+.dashboard-shell [class*="bg-[#111820]"],
+.dashboard-shell [class*="bg-[#12171d]"] {
+  background-color: var(--panel) !important;
+}
+
+.dashboard-shell [class*="bg-[#11161d]"],
+.dashboard-shell [class*="bg-[#0b1016]"],
+.dashboard-shell [class*="bg-[#0d1218]"] {
+  background-color: var(--panel-strong) !important;
+}
+
+.dashboard-shell [class*="border-white/10"] {
+  border-color: var(--line) !important;
+}
+
+.dashboard-shell [class*="text-white"],
+.dashboard-shell [class*="text-slate-100"],
+.dashboard-shell [class*="text-slate-200"] {
+  color: var(--heading) !important;
+}
+
+.dashboard-shell [class*="text-slate-300"] {
+  color: var(--app-text) !important;
+}
+
+.dashboard-shell [class*="text-slate-400"],
+.dashboard-shell [class*="text-slate-500"] {
+  color: var(--muted) !important;
+}
+
+.dashboard-shell input,
+.dashboard-shell select {
+  background-color: var(--input-bg) !important;
+  border-color: var(--line) !important;
+  color: var(--app-text) !important;
+}
+
+.dashboard-shell .theme-primary-button {
+  background-color: var(--accent) !important;
+  color: var(--accent-ink) !important;
+}
+
+.dashboard-shell .theme-secondary-button {
+  background-color: var(--secondary) !important;
+  color: var(--accent-ink) !important;
+}
+
+.dashboard-shell .theme-live-button {
+  background-color: var(--accent-soft) !important;
+  border-color: var(--accent-border) !important;
+  color: var(--accent) !important;
+}
+
+.dashboard-shell .theme-link-button {
+  background-color: var(--secondary-soft) !important;
+  border-color: var(--secondary-border) !important;
+  color: var(--secondary) !important;
+}
+
+.dashboard-shell .theme-ghost-button {
+  background-color: color-mix(in srgb, var(--panel-soft), transparent 16%) !important;
+  border-color: var(--line) !important;
+  color: var(--app-text) !important;
 }
