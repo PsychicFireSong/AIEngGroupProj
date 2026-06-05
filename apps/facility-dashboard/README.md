@@ -1,36 +1,41 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Facility AI Dashboard
 
-## Getting Started
+Next.js operations dashboard for the two-stage YOLO defect detection pipeline.
 
-First, run the development server:
+## Local Run
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+Start the FastAPI inference backend from the repository root:
+
+```powershell
+python -m uvicorn apps.inference_api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Start the dashboard:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```powershell
+cd apps/facility-dashboard
+npm install
+npm run dev
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Open `http://localhost:3000`.
 
-## Learn More
+## Vercel Frontend Deployment
 
-To learn more about Next.js, take a look at the following resources:
+Use `apps/facility-dashboard` as the Vercel project root directory.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Set this environment variable in Vercel:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```text
+NEXT_PUBLIC_INFERENCE_API_URL=https://your-inference-api-host
+```
 
-## Deploy on Vercel
+The dashboard can deploy as a normal Next.js app. The YOLO inference backend is intentionally externalized because model checkpoints, Ultralytics, OpenCV, and long video jobs are better served by a dedicated Python inference service with access to the trained `.pt` files.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Pages
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `/` dashboard overview with fleet-level metrics and trends.
+- `/monitoring` live/image/video evidence review and two-stage inference details.
+- `/analytics` aggregate charts for condition, risk, defect mix, action workload, and condition flags.
+- `/history` visual evidence archive with focused result restore.
+- `/settings` model and inference configuration.
