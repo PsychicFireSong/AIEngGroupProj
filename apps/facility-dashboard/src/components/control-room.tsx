@@ -186,7 +186,7 @@ type ModelOption = {
 };
 
 type Settings = {
-  mode: "Near real-time" | "Balanced" | "High accuracy";
+  mode: "Near real-time" | "Balanced" | "High accuracy" | "Multi-defect review";
   confidence: number;
   iou: number;
   frameIntervalMs: number;
@@ -256,6 +256,11 @@ const modeSettings: Record<Settings["mode"], Omit<Settings, "mode" | "detectorPa
     confidence: 0.45,
     iou: 0.38,
     frameIntervalMs: 1500,
+  },
+  "Multi-defect review": {
+    confidence: 0.1,
+    iou: 0.55,
+    frameIntervalMs: 1200,
   },
 };
 
@@ -1654,7 +1659,13 @@ export function ControlRoom({ page }: { page: AppPage }) {
                       <option>Near real-time</option>
                       <option>Balanced</option>
                       <option>High accuracy</option>
+                      <option>Multi-defect review</option>
                     </select>
+                    {settings.mode === "Multi-defect review" ? (
+                      <span className="mt-2 block rounded-lg border border-amber-300/25 bg-amber-300/10 px-3 py-2 text-xs leading-5 text-amber-50/80">
+                        Uses confidence 0.10 and IoU 0.55 to reveal multiple separated candidates in crowded frames. Expect more review candidates and possible false positives.
+                      </span>
+                    ) : null}
                   </label>
 
                   <Slider
@@ -2440,7 +2451,8 @@ export function ControlRoom({ page }: { page: AppPage }) {
                       <NoDetectionNotice
                         confidence={settings.confidence}
                         onReviewSensitivity={() => {
-                          setSettings((current) => ({ ...current, confidence: 0.2, mode: "Near real-time" }));
+                          setMode("Multi-defect review");
+                          setApiMessage("Multi-defect review enabled. Re-run inference to include separated lower-confidence candidates.");
                           setSettingsPanelOpen(true);
                         }}
                       />
@@ -3552,13 +3564,13 @@ function NoDetectionNotice({
       </div>
       <p className="text-sm leading-6 text-amber-50/80">
         The detector did run, but it found no defect boxes above confidence {Math.round(confidence * 100)}%.
-        Lower sensitivity can reveal weak candidates, but may also increase wrong classes.
+        Multi-defect review lowers the threshold to 10% and keeps NMS permissive enough for separated candidates.
       </p>
       <button
         className="mt-3 inline-flex h-9 items-center rounded-lg border border-amber-200/30 bg-amber-200/10 px-3 text-sm font-semibold text-amber-50 hover:bg-amber-200/15"
         onClick={onReviewSensitivity}
       >
-        Set review sensitivity
+        Enable multi-defect review
       </button>
     </div>
   );
