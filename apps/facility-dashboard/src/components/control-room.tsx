@@ -344,7 +344,7 @@ const pageMeta: Record<AppPage, { eyebrow: string; title: string; subtitle: stri
   dashboard: {
     eyebrow: "AI Facilities Operations",
     title: "Defect Intelligence Dashboard",
-    subtitle: "Fleet-level condition, risk, trends, and recent evidence in one operations view.",
+    subtitle: "Command overview for model readiness, evidence intake, processing queues, and recent inspection work.",
   },
   monitoring: {
     eyebrow: "Live Inspection",
@@ -687,24 +687,22 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const severityData = useMemo(() => severityChartData(chartDetections), [chartDetections]);
   const defectData = useMemo(() => defectChartData(chartDetections), [chartDetections]);
   const actionData = useMemo(() => actionWorkloadData(chartDetections), [chartDetections]);
-  const conditionData = useMemo(() => conditionBandData(history, latest), [history, latest]);
+  const conditionData = useMemo(
+    () => (aggregateOverviewMode && history.length === 0 ? [] : conditionBandData(history, latest)),
+    [aggregateOverviewMode, history, latest],
+  );
   const recommendationMetrics = useMemo(() => recommendationSummary(chartDetections), [chartDetections]);
 
   const trendData = useMemo(() => {
     if (history.length === 0) {
-      return [
-        { label: "T-4", condition: 100, risk: 0 },
-        { label: "T-3", condition: 98, risk: 2 },
-        { label: "T-2", condition: 96, risk: 4 },
-        { label: "T-1", condition: latest.conditionIndex, risk: latest.riskScore },
-      ];
+      return aggregateOverviewMode ? [] : [{ label: "Now", condition: latest.conditionIndex, risk: latest.riskScore }];
     }
     return history.slice().reverse().map((item, index) => ({
       label: `S${index + 1}`,
       condition: item.conditionIndex,
       risk: item.riskScore,
     }));
-  }, [history, latest.conditionIndex, latest.riskScore]);
+  }, [aggregateOverviewMode, history, latest.conditionIndex, latest.riskScore]);
 
   const criticalCount = chartDetections.filter((item) => item.severity === "critical").length;
   const immediateCount = chartDetections.filter((item) => item.priority === "Immediate").length;
@@ -1760,6 +1758,78 @@ export function ControlRoom({ page }: { page: AppPage }) {
                   </div>
                 </section>
               </div>
+            ) : dashboardMode ? (
+              <div className="grid min-h-0 gap-5 p-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(340px,0.75fr)]">
+                <section className="flex min-h-0 flex-col gap-5">
+                  <DashboardOpsPalette
+                    history={history}
+                    apiOnline={apiOnline}
+                    busy={busy}
+                    scanning={scanning}
+                    activeVideoJob={activeVideoJob}
+                    modelCount={models.filter((model) => model.value).length}
+                    estimatedThroughput={estimatedThroughput}
+                    frameCadence={frameCadence}
+                    queueStatus={queueStatus}
+                  />
+                  <DashboardOperationsOverview
+                    history={history}
+                    videoJob={videoJob}
+                    apiOnline={apiOnline}
+                    apiMessage={apiMessage}
+                    latest={latest}
+                    estimatedThroughput={estimatedThroughput}
+                    frameCadence={frameCadence}
+                    queueStatus={queueStatus}
+                    onRestoreRecord={restoreHistoryRecord}
+                    onRestoreFrame={restoreVideoFrame}
+                  />
+                </section>
+
+                <section className="flex min-h-0 flex-col gap-5">
+                  <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+                    <div className="mb-3 flex items-center justify-between">
+                      <h2 className="text-sm font-semibold text-white">Start Work</h2>
+                      <Camera className="h-4 w-4 text-slate-400" />
+                    </div>
+                    <p className="text-sm leading-6 text-slate-400">
+                      Use Monitoring for a new camera, image, video, YouTube, or Drive inspection. Use History only when you need to reopen saved evidence.
+                    </p>
+                    <div className="mt-4 grid gap-2">
+                      <Link
+                        href="/monitoring"
+                        className="theme-primary-button inline-flex h-11 items-center justify-center gap-2 rounded-lg px-4 text-sm font-semibold text-slate-950"
+                      >
+                        <Camera className="h-4 w-4" />
+                        Open Monitoring
+                      </Link>
+                      <Link
+                        href="/history"
+                        className="theme-ghost-button inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-4 text-sm font-semibold text-slate-100"
+                      >
+                        <History className="h-4 w-4" />
+                        Browse Evidence
+                      </Link>
+                    </div>
+                  </div>
+                  <StatusPanel apiOnline={apiOnline} apiMessage={apiMessage} busy={busy} scanning={scanning} />
+                  <PipelinePanel
+                    stage1Latency={latest.stageMetrics.stage1LatencyMs}
+                    stage2Latency={latest.stageMetrics.stage2LatencyMs}
+                    cropsClassified={latest.stageMetrics.cropsClassified}
+                    detectorModel={
+                      latest.stageMetrics.detectorModel === "not selected"
+                        ? modelDisplayName(settings.detectorPath)
+                        : latest.stageMetrics.detectorModel
+                    }
+                    severityModel={
+                      latest.stageMetrics.severityModel === "not selected"
+                        ? modelDisplayName(settings.severityPath)
+                        : latest.stageMetrics.severityModel
+                    }
+                  />
+                </section>
+              </div>
             ) : (
             <div
               className={`grid min-h-0 gap-5 p-5 ${
@@ -1837,7 +1907,11 @@ export function ControlRoom({ page }: { page: AppPage }) {
                       </span>
                     </div>
                     <div className={analyticsMode ? "h-[420px]" : "h-[340px]"}>
-                      <ConditionTrendChart data={trendData} />
+                      {trendData.length ? (
+                        <ConditionTrendChart data={trendData} />
+                      ) : (
+                        <EmptyMini label="Condition trend appears after saved inspection records" />
+                      )}
                     </div>
                   </div>
 
@@ -2737,8 +2811,8 @@ function MetricPalette({
     <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
       <div className="mb-3 flex items-center justify-between">
         <div>
-          <h2 className="text-sm font-semibold text-white">Operations Signals</h2>
-          <p className="mt-1 text-xs text-slate-400">Compact live indicators for the chart panels below.</p>
+          <h2 className="text-sm font-semibold text-white">Inspection Analytics Summary</h2>
+          <p className="mt-1 text-xs text-slate-400">Historical defect, severity, condition, and model-latency indicators.</p>
         </div>
         <Gauge className="h-4 w-4 text-slate-400" />
       </div>
@@ -2760,6 +2834,282 @@ function MetricPalette({
             </div>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function DashboardOpsPalette({
+  history,
+  apiOnline,
+  busy,
+  scanning,
+  activeVideoJob,
+  modelCount,
+  estimatedThroughput,
+  frameCadence,
+  queueStatus,
+}: {
+  history: InspectionRecord[];
+  apiOnline: boolean;
+  busy: boolean;
+  scanning: boolean;
+  activeVideoJob: boolean;
+  modelCount: number;
+  estimatedThroughput: string;
+  frameCadence: string;
+  queueStatus: string;
+}) {
+  const positiveCases = history.filter((record) => detectionsForRecord(record).length > 0).length;
+  const storedFrames = history.reduce((sum, record) => sum + (record.frames?.length ?? 0), 0);
+  const items = [
+    {
+      label: "API readiness",
+      value: apiOnline ? "Online" : "Offline",
+      color: apiOnline ? "text-teal-200" : "text-amber-200",
+      icon: Server,
+      progress: apiOnline ? 100 : 10,
+    },
+    {
+      label: "Model slots",
+      value: `${Math.min(modelCount, 2)}/2`,
+      color: modelCount >= 2 ? "text-cyan-200" : "text-amber-200",
+      icon: Cpu,
+      progress: Math.min(100, (modelCount / 2) * 100),
+    },
+    {
+      label: "Saved inspections",
+      value: history.length,
+      color: "text-violet-200",
+      icon: History,
+      progress: Math.min(100, history.length * 12),
+    },
+    {
+      label: "Review cases",
+      value: positiveCases,
+      color: "text-amber-200",
+      icon: ImageUp,
+      progress: Math.min(100, positiveCases * 18),
+    },
+    {
+      label: "Stored frames",
+      value: storedFrames,
+      color: "text-sky-200",
+      icon: Video,
+      progress: Math.min(100, storedFrames / 4),
+    },
+    {
+      label: "Processing state",
+      value: activeVideoJob ? queueStatus : busy ? "Running" : scanning ? "Live" : "Idle",
+      color: activeVideoJob || busy || scanning ? "text-teal-200" : "text-slate-200",
+      icon: RefreshCcw,
+      progress: activeVideoJob || busy || scanning ? 80 : 18,
+    },
+  ];
+
+  return (
+    <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-white">Operations Readiness</h2>
+          <p className="mt-1 text-xs text-slate-400">System, intake, and processing KPIs. Detailed defect analytics live on the Analytics page.</p>
+        </div>
+        <Server className="h-4 w-4 text-slate-400" />
+      </div>
+      <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-6">
+        {items.map((item) => (
+          <div key={item.label} className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="truncate text-[11px] uppercase tracking-[0.14em] text-slate-500">{item.label}</p>
+                <p className={`mt-1 truncate text-lg font-semibold ${item.color}`}>{item.value}</p>
+              </div>
+              <item.icon className="h-4 w-4 shrink-0 text-slate-500" />
+            </div>
+            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-black/25">
+              <div
+                className={`h-full rounded-full bg-current transition-all ${item.color}`}
+                style={{ width: `${Math.max(4, Math.min(100, item.progress))}%` }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 grid gap-2 md:grid-cols-2">
+        <TelemetryChip icon={Activity} label="Runtime capacity" value={estimatedThroughput} tone="text-cyan-200" />
+        <TelemetryChip icon={RefreshCcw} label="Capture cadence" value={frameCadence} tone="text-teal-200" />
+      </div>
+    </div>
+  );
+}
+
+function DashboardOperationsOverview({
+  history,
+  videoJob,
+  apiOnline,
+  apiMessage,
+  latest,
+  estimatedThroughput,
+  frameCadence,
+  queueStatus,
+  onRestoreRecord,
+  onRestoreFrame,
+}: {
+  history: InspectionRecord[];
+  videoJob: VideoJob | null;
+  apiOnline: boolean;
+  apiMessage: string;
+  latest: InferenceResult;
+  estimatedThroughput: string;
+  frameCadence: string;
+  queueStatus: string;
+  onRestoreRecord: (record: InspectionRecord) => void;
+  onRestoreFrame: (frame: VideoFrameSummary, record: InspectionRecord) => void;
+}) {
+  const positiveCases = history.filter((record) => detectionsForRecord(record).length > 0).length;
+  const videoRecords = history.filter((record) => record.source === "video").length;
+  const storedFrames = history.reduce((sum, record) => sum + (record.frames?.length ?? 0), 0);
+  const sourceData = [
+    { name: "Images", value: history.filter((record) => record.source === "image").length, color: "#38bdf8" },
+    { name: "Videos", value: videoRecords, color: "#a78bfa" },
+    { name: "Camera", value: history.filter((record) => record.source === "camera").length, color: "#2dd4bf" },
+  ].filter((item) => item.value > 0);
+  const coverageData = [
+    { name: "Records", value: history.length, color: "#38bdf8" },
+    { name: "Review cases", value: positiveCases, color: "#f59e0b" },
+    { name: "Video records", value: videoRecords, color: "#a78bfa" },
+    { name: "Stored frames", value: storedFrames, color: "#2dd4bf" },
+  ].filter((item) => item.value > 0);
+  const recentItems = history.slice(0, 3).map((record) => {
+    const defectFrames = record.frames?.filter((frame) => frame.detections > 0) ?? [];
+    const firstFrame = defectFrames.find((frame) => frame.evidenceImage || frame.annotatedImage);
+    return {
+      record,
+      defectFrames,
+      firstFrame,
+      preview: firstFrame?.evidenceImage ?? firstFrame?.annotatedImage ?? previewForRecord(record),
+      detectionCount: detectionsForRecord(record).length,
+    };
+  });
+  const queueProgress = videoJob ? Math.max(0, Math.min(100, Math.round(videoJob.progress || 0))) : 0;
+
+  return (
+    <div className="grid gap-5">
+      <div className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_minmax(330px,0.75fr)]">
+        <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-white">Inspection Intake Mix</h2>
+              <p className="mt-1 text-xs text-slate-400">Historical saved records grouped by media source.</p>
+            </div>
+            <ImageUp className="h-4 w-4 text-slate-400" />
+          </div>
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_210px]">
+            <div className="h-52 rounded-lg border border-white/10 bg-black/10 p-2">
+              {sourceData.length ? <MetricBarChart data={sourceData} /> : <EmptyMini label="Intake mix appears after saved inspections" />}
+            </div>
+            <div className="grid gap-2">
+              <TelemetryChip icon={History} label="records" value={String(history.length)} tone="text-cyan-200" />
+              <TelemetryChip icon={ImageUp} label="review cases" value={String(positiveCases)} tone="text-amber-200" />
+              <TelemetryChip icon={Video} label="stored frames" value={String(storedFrames)} tone="text-violet-200" />
+            </div>
+          </div>
+        </div>
+
+        <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-white">Processing Queue</h2>
+              <p className="mt-1 text-xs text-slate-400">Current backend and video task state, not defect-condition scoring.</p>
+            </div>
+            <RefreshCcw className="h-4 w-4 text-slate-400" />
+          </div>
+          <div className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="truncate text-[11px] uppercase tracking-[0.14em] text-slate-500">Queue status</p>
+                <p className="mt-1 truncate text-lg font-semibold text-white">{queueStatus}</p>
+                <p className="mt-1 truncate text-xs text-slate-400">{videoJob?.message || apiMessage}</p>
+              </div>
+              {apiOnline ? (
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-teal-300" />
+              ) : (
+                <AlertTriangle className="h-4 w-4 shrink-0 text-amber-300" />
+              )}
+            </div>
+            <div className="mt-3 h-2 overflow-hidden rounded-full bg-black/30">
+              <div className="h-full rounded-full bg-violet-300 transition-all" style={{ width: `${videoJob ? queueProgress : apiOnline ? 100 : 10}%` }} />
+            </div>
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            <TelemetryChip icon={Activity} label="runtime" value={estimatedThroughput} tone="text-cyan-200" />
+            <TelemetryChip icon={RefreshCcw} label="cadence" value={frameCadence} tone="text-teal-200" />
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.05fr)]">
+        <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-white">Review Coverage</h2>
+              <p className="mt-1 text-xs text-slate-400">Operational coverage counts from saved inspections.</p>
+            </div>
+            <Layers className="h-4 w-4 text-slate-400" />
+          </div>
+          <div className="h-52 rounded-lg border border-white/10 bg-black/10 p-2">
+            {coverageData.length ? <MetricBarChart data={coverageData} /> : <EmptyMini label="Coverage appears after saved inspections" />}
+          </div>
+          <p className="mt-3 text-xs leading-5 text-slate-400">
+            Analytics converts these records into condition/risk trends, severity mix, class balance, and action quality.
+          </p>
+        </div>
+
+        <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-white">Recent Evidence Intake</h2>
+            <ImageUp className="h-4 w-4 text-slate-400" />
+          </div>
+          {recentItems.length ? (
+            <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3">
+              {recentItems.map(({ record, defectFrames, firstFrame, preview, detectionCount }) => (
+                <button
+                  key={record.id}
+                  onClick={() => (firstFrame ? onRestoreFrame(firstFrame, record) : onRestoreRecord(record))}
+                  className="group overflow-hidden rounded-lg border border-white/10 bg-white/[0.03] text-left transition hover:border-cyan-300/35 hover:bg-white/[0.06]"
+                >
+                  <div className="relative aspect-video bg-black/35">
+                    {preview ? (
+                      <div
+                        className="h-full w-full bg-cover bg-center"
+                        role="img"
+                        aria-label={`${record.asset} preview`}
+                        style={{ backgroundImage: `url(${preview})` }}
+                      />
+                    ) : (
+                      <div className="grid h-full place-items-center text-[10px] text-slate-500">No preview</div>
+                    )}
+                    <span className="absolute left-2 top-2 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] font-semibold text-slate-100">
+                      {record.source}
+                    </span>
+                  </div>
+                  <div className="p-3">
+                    <p className="truncate text-sm font-semibold text-white">{record.asset}</p>
+                    <p className="mt-1 text-xs text-slate-400">
+                      {record.source === "video" ? `${defectFrames.length} defect frames` : `${detectionCount} detections`}
+                    </p>
+                    <p className="mt-1 truncate text-xs text-slate-500">{record.createdAt}</p>
+                  </div>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <EmptyMini label="Recent evidence appears after image, video, or live monitoring results" />
+          )}
+          {latest.latencyMs > 0 ? (
+            <p className="mt-3 text-xs text-slate-400">Latest active result latency: {formatMs(latest.latencyMs)}</p>
+          ) : null}
+        </div>
       </div>
     </div>
   );
