@@ -12,6 +12,7 @@ import {
   Gauge,
   History,
   ImageUp,
+  Info as InfoIcon,
   Layers,
   Link2,
   LayoutDashboard,
@@ -152,6 +153,19 @@ type InspectionRecord = Omit<InferenceResult, "source"> & {
   sourceUrl?: string;
   frames?: VideoFrameSummary[];
   scannedFrames?: number;
+};
+
+type DashboardCase = {
+  id: string;
+  asset: string;
+  createdAt: string;
+  source: InspectionRecord["source"] | "current";
+  detections: Detection[];
+  conditionIndex: number;
+  riskScore: number;
+  preview: string;
+  record?: InspectionRecord;
+  isCurrent?: boolean;
 };
 
 type VideoJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -612,6 +626,41 @@ function previewForRecord(record: InspectionRecord) {
   );
 }
 
+function dashboardCaseItems(history: InspectionRecord[], latest: InferenceResult): DashboardCase[] {
+  const historicalCases: DashboardCase[] = history.map((record) => ({
+    id: record.id,
+    asset: record.asset,
+    createdAt: record.createdAt,
+    source: record.source,
+    detections: detectionsForRecord(record),
+    conditionIndex: record.conditionIndex,
+    riskScore: record.riskScore,
+    preview: previewForRecord(record),
+    record,
+  }));
+
+  const currentCase: DashboardCase[] = latest.detections.length
+    ? [
+        {
+          id: "current-inspection",
+          asset: "Current inspection result",
+          createdAt: "Live session",
+          source: "current",
+          detections: latest.detections,
+          conditionIndex: latest.conditionIndex,
+          riskScore: latest.riskScore,
+          preview: latest.evidenceImage ?? latest.annotatedImage ?? "",
+          isCurrent: true,
+        },
+      ]
+    : [];
+
+  return [...currentCase, ...historicalCases]
+    .filter((item) => item.detections.length > 0 || item.riskScore > 0)
+    .sort((a, b) => b.riskScore - a.riskScore || b.detections.length - a.detections.length)
+    .slice(0, 8);
+}
+
 export function ControlRoom({ page }: { page: AppPage }) {
   const router = useRouter();
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -663,6 +712,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const [analysisStartedAt, setAnalysisStartedAt] = useState<number | null>(null);
   const [analysisElapsedSec, setAnalysisElapsedSec] = useState(0);
   const [dragActive, setDragActive] = useState(false);
+  const [riskInfoOpen, setRiskInfoOpen] = useState(false);
 
   const detectorModels = models.filter((model) => model.kind === "detector");
   const severityModels = models.filter((model) => model.kind === "severity");
@@ -672,6 +722,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const activeVideoJob = videoJob?.status === "queued" || videoJob?.status === "running";
   const themeStyle = useMemo(() => dashboardThemeStyle(themeMode, paletteName), [themeMode, paletteName]);
   const currentPageMeta = pageMeta[page];
+  const dashboardMode = page === "dashboard";
   const analyticsMode = page === "analytics";
   const historyMode = page === "history";
 
@@ -685,6 +736,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const actionData = useMemo(() => actionWorkloadData(chartDetections), [chartDetections]);
   const conditionData = useMemo(() => conditionBandData(history, latest), [history, latest]);
   const recommendationMetrics = useMemo(() => recommendationSummary(chartDetections), [chartDetections]);
+  const dashboardCases = useMemo(() => dashboardCaseItems(history, latest), [history, latest]);
 
   const trendData = useMemo(() => {
     if (history.length === 0) {
@@ -1765,6 +1817,20 @@ export function ControlRoom({ page }: { page: AppPage }) {
               }`}
             >
               <section className="flex min-h-0 flex-col gap-5">
+                {dashboardMode ? (
+                  <DashboardCaseBoard
+                    cases={dashboardCases}
+                    onOpenCase={(item) => {
+                      if (item.record) {
+                        restoreHistoryRecord(item.record);
+                        return;
+                      }
+                      setWorkspaceView("monitor");
+                      setMonitorPanel(item.detections.length ? "selected" : "findings");
+                      setSelectedDetectionId(item.detections[0]?.id ?? "");
+                    }}
+                  />
+                ) : null}
                 <MetricPalette
                   detections={chartDetections.length}
                   critical={criticalCount}
@@ -1773,7 +1839,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
                   condition={signalCondition}
                 />
                 <div className="grid gap-5 2xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
-                  <div ref={analyticsRef} className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+                  <div ref={analyticsRef} className="enterprise-panel relative border border-white/10 bg-[#111820] p-4">
                     <div className="mb-3 flex items-center justify-between">
                       <div>
                         <h2 className="text-sm font-semibold text-white">Condition and Risk Trend</h2>
@@ -1781,41 +1847,59 @@ export function ControlRoom({ page }: { page: AppPage }) {
                           A triage trend for inspection records, not a structural certificate. Use it to spot whether asset condition is improving or worsening.
                         </p>
                       </div>
-                      <Activity className="h-4 w-4 text-slate-400" />
-                    </div>
-                    <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(270px,0.42fr)]">
-                      <div className={analyticsMode ? "h-[380px]" : "h-[320px]"}>
-                        <ConditionTrendChart data={trendData} />
+                      <div className="flex shrink-0 items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setRiskInfoOpen((value) => !value)}
+                          className="grid h-8 w-8 place-items-center rounded-lg border border-white/10 bg-white/[0.04] text-slate-300 transition hover:bg-white/[0.08]"
+                          title="Explain condition and risk index"
+                          aria-label="Explain condition and risk index"
+                        >
+                          <InfoIcon className="h-4 w-4" />
+                        </button>
+                        <Activity className="h-4 w-4 text-slate-400" />
                       </div>
-                      <div className="grid gap-3 text-xs sm:grid-cols-3 xl:grid-cols-1">
-                        <div className="rounded-lg border border-teal-300/20 bg-teal-300/10 p-3">
-                          <div className="mb-2 flex items-center gap-2 font-semibold text-teal-100">
-                            <span className="h-2 w-6 rounded-full bg-teal-300" />
-                            Condition index
-                          </div>
-                          <p className="leading-relaxed text-slate-300">
-                            Estimated asset health on a 0-100 scale. <strong className="text-white">100</strong> means no detected issue in the selected
-                            evidence; lower values mean the detected defects are more serious, larger, or more confident.
-                          </p>
+                    </div>
+                    {riskInfoOpen ? (
+                      <div className="absolute right-4 top-14 z-20 w-[min(420px,calc(100%-2rem))] rounded-xl border border-white/15 bg-[#090f14]/95 p-4 text-xs shadow-2xl shadow-black/40 backdrop-blur">
+                        <div className="mb-3 flex items-center justify-between">
+                          <p className="font-semibold text-white">Metric Definitions</p>
+                          <button
+                            type="button"
+                            onClick={() => setRiskInfoOpen(false)}
+                            className="rounded-md border border-white/10 px-2 py-1 text-slate-300 hover:bg-white/[0.08]"
+                          >
+                            Close
+                          </button>
                         </div>
-                        <div className="rounded-lg border border-amber-400/20 bg-amber-400/10 p-3">
-                          <div className="mb-2 flex items-center gap-2 font-semibold text-amber-100">
-                            <span className="h-2 w-6 rounded-full bg-amber-500" />
-                            Risk score
-                          </div>
+                        <div className="grid gap-3">
                           <p className="leading-relaxed text-slate-300">
-                            Maintenance urgency on a 0-100 scale. It increases with <strong className="text-white">severity tier</strong>, detector confidence,
-                            defect area, and the number of detections.
+                            <strong className="text-teal-100">Condition index</strong> is estimated asset health on a 0-100 scale. 100 means no detected issue;
+                            lower values mean the evidence contains more serious, larger, or more confident defects.
                           </p>
-                        </div>
-                        <div className="rounded-lg border border-white/10 bg-white/[0.04] p-3">
-                          <div className="mb-2 font-semibold text-slate-100">How to read it</div>
+                          <p className="leading-relaxed text-slate-300">
+                            <strong className="text-amber-100">Risk score</strong> is maintenance urgency on a 0-100 scale. It increases with severity tier,
+                            detector confidence, defect area, and detection count.
+                          </p>
                           <p className="leading-relaxed text-slate-300">
                             The backend computes <strong className="text-white">Condition = 100 - Risk</strong>. A rising risk line or falling condition line means
                             the asset should move higher in the inspection queue.
                           </p>
                         </div>
                       </div>
+                    ) : null}
+                    <div className="mb-2 flex flex-wrap gap-3 text-xs text-slate-300">
+                      <span className="inline-flex items-center gap-2">
+                        <span className="h-2 w-6 rounded-full bg-teal-300" />
+                        Condition
+                      </span>
+                      <span className="inline-flex items-center gap-2">
+                        <span className="h-2 w-6 rounded-full bg-amber-500" />
+                        Risk
+                      </span>
+                    </div>
+                    <div className={analyticsMode ? "h-[420px]" : "h-[340px]"}>
+                      <ConditionTrendChart data={trendData} />
                     </div>
                   </div>
 
@@ -1860,19 +1944,28 @@ export function ControlRoom({ page }: { page: AppPage }) {
                 {!analyticsMode ? (
                   <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
                     <div className="mb-3 flex items-center justify-between">
-                      <h2 className="text-sm font-semibold text-white">Operations Shortcut</h2>
+                      <h2 className="text-sm font-semibold text-white">Case Controls</h2>
                       <Camera className="h-4 w-4 text-slate-400" />
                     </div>
                     <p className="text-sm leading-6 text-slate-400">
-                      Open the monitoring workspace when you need camera, image, Drive, YouTube, or video evidence analysis.
+                      Start a new inspection when the case queue is empty, or reopen saved evidence from History for focused review.
                     </p>
-                    <Link
-                      href="/monitoring"
-                      className="theme-primary-button mt-4 inline-flex h-11 items-center gap-2 rounded-lg px-4 text-sm font-semibold text-slate-950"
-                    >
-                      <Camera className="h-4 w-4" />
-                      Open Monitoring
-                    </Link>
+                    <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+                      <Link
+                        href="/monitoring"
+                        className="theme-primary-button inline-flex h-11 items-center justify-center gap-2 rounded-lg px-4 text-sm font-semibold text-slate-950"
+                      >
+                        <Camera className="h-4 w-4" />
+                        New inspection
+                      </Link>
+                      <Link
+                        href="/history"
+                        className="theme-ghost-button inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-4 text-sm font-semibold text-slate-100"
+                      >
+                        <History className="h-4 w-4" />
+                        Open history
+                      </Link>
+                    </div>
                   </div>
                 ) : null}
                 <StatusPanel apiOnline={apiOnline} apiMessage={apiMessage} busy={busy} scanning={scanning} />
@@ -2677,6 +2770,160 @@ function StageRow({
           {metric}
         </span>
       </div>
+    </div>
+  );
+}
+
+function DashboardCaseBoard({
+  cases,
+  onOpenCase,
+}: {
+  cases: DashboardCase[];
+  onOpenCase: (item: DashboardCase) => void;
+}) {
+  const primary = cases[0];
+  const queue = cases.slice(1, 6);
+  const classNames = primary
+    ? Array.from(new Set(primary.detections.map((item) => item.className))).slice(0, 4)
+    : [];
+  const immediate = primary?.detections.filter((item) => item.priority === "Immediate").length ?? 0;
+  const planned = primary?.detections.filter((item) => item.priority === "Planned").length ?? 0;
+
+  return (
+    <div className="enterprise-panel border border-cyan-300/20 bg-[#111820] p-4">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-white">Active Case Focus</h2>
+          <p className="mt-1 text-xs text-slate-400">The dashboard entry starts from the highest-risk inspection case, then rolls up into metrics.</p>
+        </div>
+        <Link
+          href="/monitoring"
+          className="theme-primary-button inline-flex h-10 items-center justify-center gap-2 rounded-lg px-3 text-sm font-semibold text-slate-950"
+        >
+          <Camera className="h-4 w-4" />
+          New inspection
+        </Link>
+      </div>
+
+      {primary ? (
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(300px,0.8fr)]">
+          <button
+            type="button"
+            onClick={() => onOpenCase(primary)}
+            className="group grid overflow-hidden rounded-xl border border-white/10 bg-white/[0.03] text-left transition hover:border-cyan-300/35 hover:bg-white/[0.06] md:grid-cols-[minmax(260px,0.78fr)_minmax(0,1fr)]"
+          >
+            <div className="relative aspect-video h-full min-h-[220px] bg-black/35">
+              {primary.preview ? (
+                <div
+                  role="img"
+                  aria-label={`${primary.asset} case evidence`}
+                  className="h-full w-full bg-cover bg-center"
+                  style={{ backgroundImage: `url(${primary.preview})` }}
+                />
+              ) : (
+                <div className="grid h-full place-items-center text-xs text-slate-500">Evidence preview appears after review</div>
+              )}
+              <span className={`absolute left-3 top-3 rounded-md border bg-black/60 px-2 py-1 text-xs font-semibold ${scoreTone(primary.conditionIndex)}`}>
+                CI {primary.conditionIndex.toFixed(0)}
+              </span>
+              <span className="absolute bottom-3 right-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-xs text-slate-200">
+                {primary.detections.length} finding{primary.detections.length === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="flex min-h-[220px] flex-col justify-between p-4">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full border border-cyan-300/25 bg-cyan-300/10 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-100">
+                    {primary.source}
+                  </span>
+                  {immediate ? (
+                    <span className="rounded-full border border-rose-300/25 bg-rose-300/10 px-2 py-1 text-[11px] font-semibold text-rose-100">
+                      {immediate} immediate
+                    </span>
+                  ) : null}
+                  {planned ? (
+                    <span className="rounded-full border border-amber-300/25 bg-amber-300/10 px-2 py-1 text-[11px] font-semibold text-amber-100">
+                      {planned} planned
+                    </span>
+                  ) : null}
+                </div>
+                <h3 className="mt-3 text-xl font-semibold text-white">{primary.asset}</h3>
+                <p className="mt-1 text-sm text-slate-400">{primary.createdAt}</p>
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <Info label="Risk score" value={primary.riskScore.toFixed(1)} />
+                  <Info label="Condition" value={primary.conditionIndex.toFixed(1)} />
+                </div>
+                <div className="mt-4 flex flex-wrap gap-1.5">
+                  {classNames.length ? (
+                    classNames.map((name) => (
+                      <span key={name} className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] text-slate-300">
+                        {name}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] text-slate-400">
+                      no class tags
+                    </span>
+                  )}
+                </div>
+              </div>
+              <span className="mt-4 inline-flex h-10 items-center justify-center rounded-lg border border-cyan-300/25 bg-cyan-300/10 px-3 text-sm font-semibold text-cyan-100 transition group-hover:bg-cyan-300/15">
+                Open focused review
+              </span>
+            </div>
+          </button>
+
+          <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-white">Case Queue</h3>
+              <span className="rounded-md border border-white/10 bg-black/20 px-2 py-1 text-xs text-slate-300">{cases.length} active</span>
+            </div>
+            {queue.length ? (
+              <div className="space-y-2">
+                {queue.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => onOpenCase(item)}
+                    className="grid w-full grid-cols-[1fr_auto] gap-3 rounded-lg border border-white/10 bg-black/10 p-3 text-left transition hover:bg-white/[0.06]"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-semibold text-white">{item.asset}</span>
+                      <span className="mt-1 block truncate text-xs text-slate-400">
+                        {item.detections.length} finding{item.detections.length === 1 ? "" : "s"} | {item.source}
+                      </span>
+                    </span>
+                    <span className={`font-mono text-sm font-semibold ${scoreTone(item.conditionIndex)}`}>{item.conditionIndex.toFixed(0)}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="grid min-h-[170px] place-items-center rounded-lg border border-dashed border-white/10 text-center text-sm text-slate-400">
+                More cases appear here after additional inspections.
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="grid min-h-[260px] place-items-center rounded-xl border border-dashed border-white/10 bg-white/[0.03] p-6 text-center">
+          <div>
+            <div className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded-lg border border-cyan-300/25 bg-cyan-300/10">
+              <Camera className="h-5 w-5 text-cyan-100" />
+            </div>
+            <h3 className="text-lg font-semibold text-white">No active inspection case yet</h3>
+            <p className="mt-2 max-w-md text-sm leading-6 text-slate-400">
+              Run an image, camera, or video inspection first. The dashboard will then pin the highest-risk case here.
+            </p>
+            <Link
+              href="/monitoring"
+              className="theme-primary-button mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg px-3 text-sm font-semibold text-slate-950"
+            >
+              <Camera className="h-4 w-4" />
+              Start monitoring
+            </Link>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
