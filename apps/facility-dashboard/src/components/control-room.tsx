@@ -155,19 +155,6 @@ type InspectionRecord = Omit<InferenceResult, "source"> & {
   scannedFrames?: number;
 };
 
-type DashboardCase = {
-  id: string;
-  asset: string;
-  createdAt: string;
-  source: InspectionRecord["source"] | "current";
-  detections: Detection[];
-  conditionIndex: number;
-  riskScore: number;
-  preview: string;
-  record?: InspectionRecord;
-  isCurrent?: boolean;
-};
-
 type VideoJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 type VideoJob = {
@@ -626,41 +613,6 @@ function previewForRecord(record: InspectionRecord) {
   );
 }
 
-function dashboardCaseItems(history: InspectionRecord[], latest: InferenceResult): DashboardCase[] {
-  const historicalCases: DashboardCase[] = history.map((record) => ({
-    id: record.id,
-    asset: record.asset,
-    createdAt: record.createdAt,
-    source: record.source,
-    detections: detectionsForRecord(record),
-    conditionIndex: record.conditionIndex,
-    riskScore: record.riskScore,
-    preview: previewForRecord(record),
-    record,
-  }));
-
-  const currentCase: DashboardCase[] = latest.detections.length
-    ? [
-        {
-          id: "current-inspection",
-          asset: "Current inspection result",
-          createdAt: "Live session",
-          source: "current",
-          detections: latest.detections,
-          conditionIndex: latest.conditionIndex,
-          riskScore: latest.riskScore,
-          preview: latest.evidenceImage ?? latest.annotatedImage ?? "",
-          isCurrent: true,
-        },
-      ]
-    : [];
-
-  return [...currentCase, ...historicalCases]
-    .filter((item) => item.detections.length > 0 || item.riskScore > 0)
-    .sort((a, b) => b.riskScore - a.riskScore || b.detections.length - a.detections.length)
-    .slice(0, 8);
-}
-
 export function ControlRoom({ page }: { page: AppPage }) {
   const router = useRouter();
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -725,18 +677,18 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const dashboardMode = page === "dashboard";
   const analyticsMode = page === "analytics";
   const historyMode = page === "history";
+  const aggregateOverviewMode = dashboardMode || analyticsMode || historyMode;
 
   const analyticsDetections = useMemo(() => {
     if (!history.length) return latest.detections;
     return history.flatMap((record) => detectionsForRecord(record));
   }, [history, latest.detections]);
-  const chartDetections = analyticsMode || historyMode ? analyticsDetections : latest.detections;
+  const chartDetections = aggregateOverviewMode ? analyticsDetections : latest.detections;
   const severityData = useMemo(() => severityChartData(chartDetections), [chartDetections]);
   const defectData = useMemo(() => defectChartData(chartDetections), [chartDetections]);
   const actionData = useMemo(() => actionWorkloadData(chartDetections), [chartDetections]);
   const conditionData = useMemo(() => conditionBandData(history, latest), [history, latest]);
   const recommendationMetrics = useMemo(() => recommendationSummary(chartDetections), [chartDetections]);
-  const dashboardCases = useMemo(() => dashboardCaseItems(history, latest), [history, latest]);
 
   const trendData = useMemo(() => {
     if (history.length === 0) {
@@ -757,11 +709,11 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const criticalCount = chartDetections.filter((item) => item.severity === "critical").length;
   const immediateCount = chartDetections.filter((item) => item.priority === "Immediate").length;
   const signalCondition =
-    (analyticsMode || historyMode) && history.length
+    aggregateOverviewMode && history.length
       ? history.reduce((sum, record) => sum + record.conditionIndex, 0) / history.length
       : latest.conditionIndex;
   const signalLatency =
-    (analyticsMode || historyMode) && history.length
+    aggregateOverviewMode && history.length
       ? history.reduce((sum, record) => sum + record.latencyMs, 0) / history.length
       : latest.latencyMs;
 
@@ -1817,20 +1769,6 @@ export function ControlRoom({ page }: { page: AppPage }) {
               }`}
             >
               <section className="flex min-h-0 flex-col gap-5">
-                {dashboardMode ? (
-                  <DashboardCaseBoard
-                    cases={dashboardCases}
-                    onOpenCase={(item) => {
-                      if (item.record) {
-                        restoreHistoryRecord(item.record);
-                        return;
-                      }
-                      setWorkspaceView("monitor");
-                      setMonitorPanel(item.detections.length ? "selected" : "findings");
-                      setSelectedDetectionId(item.detections[0]?.id ?? "");
-                    }}
-                  />
-                ) : null}
                 <MetricPalette
                   detections={chartDetections.length}
                   critical={criticalCount}
@@ -1918,7 +1856,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
                     <div>
                       <h2 className="text-sm font-semibold text-white">Defect Distribution</h2>
                       <p className="mt-1 text-xs text-slate-400">
-                        {analyticsMode || historyMode
+                        {aggregateOverviewMode
                           ? "Class balance across saved inspection records."
                           : "Class balance in the latest restored or live inspection result."}
                       </p>
@@ -2770,160 +2708,6 @@ function StageRow({
           {metric}
         </span>
       </div>
-    </div>
-  );
-}
-
-function DashboardCaseBoard({
-  cases,
-  onOpenCase,
-}: {
-  cases: DashboardCase[];
-  onOpenCase: (item: DashboardCase) => void;
-}) {
-  const primary = cases[0];
-  const queue = cases.slice(1, 6);
-  const classNames = primary
-    ? Array.from(new Set(primary.detections.map((item) => item.className))).slice(0, 4)
-    : [];
-  const immediate = primary?.detections.filter((item) => item.priority === "Immediate").length ?? 0;
-  const planned = primary?.detections.filter((item) => item.priority === "Planned").length ?? 0;
-
-  return (
-    <div className="enterprise-panel border border-cyan-300/20 bg-[#111820] p-4">
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-sm font-semibold text-white">Active Case Focus</h2>
-          <p className="mt-1 text-xs text-slate-400">The dashboard entry starts from the highest-risk inspection case, then rolls up into metrics.</p>
-        </div>
-        <Link
-          href="/monitoring"
-          className="theme-primary-button inline-flex h-10 items-center justify-center gap-2 rounded-lg px-3 text-sm font-semibold text-slate-950"
-        >
-          <Camera className="h-4 w-4" />
-          New inspection
-        </Link>
-      </div>
-
-      {primary ? (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(300px,0.8fr)]">
-          <button
-            type="button"
-            onClick={() => onOpenCase(primary)}
-            className="group grid overflow-hidden rounded-xl border border-white/10 bg-white/[0.03] text-left transition hover:border-cyan-300/35 hover:bg-white/[0.06] md:grid-cols-[minmax(260px,0.78fr)_minmax(0,1fr)]"
-          >
-            <div className="relative aspect-video h-full min-h-[220px] bg-black/35">
-              {primary.preview ? (
-                <div
-                  role="img"
-                  aria-label={`${primary.asset} case evidence`}
-                  className="h-full w-full bg-cover bg-center"
-                  style={{ backgroundImage: `url(${primary.preview})` }}
-                />
-              ) : (
-                <div className="grid h-full place-items-center text-xs text-slate-500">Evidence preview appears after review</div>
-              )}
-              <span className={`absolute left-3 top-3 rounded-md border bg-black/60 px-2 py-1 text-xs font-semibold ${scoreTone(primary.conditionIndex)}`}>
-                CI {primary.conditionIndex.toFixed(0)}
-              </span>
-              <span className="absolute bottom-3 right-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-xs text-slate-200">
-                {primary.detections.length} finding{primary.detections.length === 1 ? "" : "s"}
-              </span>
-            </div>
-            <div className="flex min-h-[220px] flex-col justify-between p-4">
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="rounded-full border border-cyan-300/25 bg-cyan-300/10 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-100">
-                    {primary.source}
-                  </span>
-                  {immediate ? (
-                    <span className="rounded-full border border-rose-300/25 bg-rose-300/10 px-2 py-1 text-[11px] font-semibold text-rose-100">
-                      {immediate} immediate
-                    </span>
-                  ) : null}
-                  {planned ? (
-                    <span className="rounded-full border border-amber-300/25 bg-amber-300/10 px-2 py-1 text-[11px] font-semibold text-amber-100">
-                      {planned} planned
-                    </span>
-                  ) : null}
-                </div>
-                <h3 className="mt-3 text-xl font-semibold text-white">{primary.asset}</h3>
-                <p className="mt-1 text-sm text-slate-400">{primary.createdAt}</p>
-                <div className="mt-4 grid grid-cols-2 gap-3">
-                  <Info label="Risk score" value={primary.riskScore.toFixed(1)} />
-                  <Info label="Condition" value={primary.conditionIndex.toFixed(1)} />
-                </div>
-                <div className="mt-4 flex flex-wrap gap-1.5">
-                  {classNames.length ? (
-                    classNames.map((name) => (
-                      <span key={name} className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] text-slate-300">
-                        {name}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] text-slate-400">
-                      no class tags
-                    </span>
-                  )}
-                </div>
-              </div>
-              <span className="mt-4 inline-flex h-10 items-center justify-center rounded-lg border border-cyan-300/25 bg-cyan-300/10 px-3 text-sm font-semibold text-cyan-100 transition group-hover:bg-cyan-300/15">
-                Open focused review
-              </span>
-            </div>
-          </button>
-
-          <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-white">Case Queue</h3>
-              <span className="rounded-md border border-white/10 bg-black/20 px-2 py-1 text-xs text-slate-300">{cases.length} active</span>
-            </div>
-            {queue.length ? (
-              <div className="space-y-2">
-                {queue.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => onOpenCase(item)}
-                    className="grid w-full grid-cols-[1fr_auto] gap-3 rounded-lg border border-white/10 bg-black/10 p-3 text-left transition hover:bg-white/[0.06]"
-                  >
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-semibold text-white">{item.asset}</span>
-                      <span className="mt-1 block truncate text-xs text-slate-400">
-                        {item.detections.length} finding{item.detections.length === 1 ? "" : "s"} | {item.source}
-                      </span>
-                    </span>
-                    <span className={`font-mono text-sm font-semibold ${scoreTone(item.conditionIndex)}`}>{item.conditionIndex.toFixed(0)}</span>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="grid min-h-[170px] place-items-center rounded-lg border border-dashed border-white/10 text-center text-sm text-slate-400">
-                More cases appear here after additional inspections.
-              </div>
-            )}
-          </div>
-        </div>
-      ) : (
-        <div className="grid min-h-[260px] place-items-center rounded-xl border border-dashed border-white/10 bg-white/[0.03] p-6 text-center">
-          <div>
-            <div className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded-lg border border-cyan-300/25 bg-cyan-300/10">
-              <Camera className="h-5 w-5 text-cyan-100" />
-            </div>
-            <h3 className="text-lg font-semibold text-white">No active inspection case yet</h3>
-            <p className="mt-2 max-w-md text-sm leading-6 text-slate-400">
-              Run an image, camera, or video inspection first. The dashboard will then pin the highest-risk case here.
-            </p>
-            <Link
-              href="/monitoring"
-              className="theme-primary-button mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg px-3 text-sm font-semibold text-slate-950"
-            >
-              <Camera className="h-4 w-4" />
-              Start monitoring
-            </Link>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
