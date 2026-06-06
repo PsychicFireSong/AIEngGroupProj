@@ -30,7 +30,7 @@ Set this environment variable in Vercel:
 NEXT_PUBLIC_INFERENCE_API_URL=https://your-inference-api-host
 ```
 
-The dashboard can deploy as a normal Next.js app. The YOLO inference backend is intentionally externalized because model checkpoints, Ultralytics, OpenCV, and long video jobs are better served by a dedicated Python inference service with access to the trained `.pt` files.
+The dashboard can deploy as a normal Next.js app. The repo currently includes canonical local-test `.pt` files through Git LFS, but the YOLO inference backend should still be hosted separately for deployment because Ultralytics, OpenCV, model loading, and long video jobs are better served by a dedicated Python inference service.
 
 ## Pages
 

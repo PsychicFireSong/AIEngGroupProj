@@ -10,10 +10,13 @@ inspection_history/
 *.engine
 *.torchscript
 weights/
+!weights/
+weights/*
+!weights/defect_detector.pt
+!weights/severity_cls.pt
 weights/drive_download/
 weights/drive_live_check/
 weights/drive_selected/
-weights/*.pt
 runs/
 
 # Browser verification artifacts.

@@ -12,7 +12,7 @@ The intended production shape is:
 - Python FastAPI inference backend hosted separately with access to trained `.pt` weights.
 - Frontend points to the backend through `NEXT_PUBLIC_INFERENCE_API_URL`.
 
-Model checkpoints are intentionally not committed to Git. Keep `.pt` files in Google Drive, model storage, or the inference server filesystem.
+The current local-testing detector and severity checkpoints are included under `weights/` through Git LFS so teammates can run the app immediately after cloning. Larger experiments and older checkpoints should still stay in Google Drive, model storage, or the inference server filesystem.
 
 ## What The System Does
 
@@ -86,7 +86,7 @@ weights/defect_detector.pt
 weights/severity_cls.pt
 ```
 
-These files are ignored by Git.
+These two canonical local-test files are tracked with Git LFS. Other `.pt` files are ignored by Git.
 
 ## Run Locally
 
@@ -235,10 +235,10 @@ python scripts/wider_production_sweep.py --help
 
 ## Security And Cleanup Rules
 
-- Do not commit `.pt` model weights.
+- Do not commit extra `.pt` model weights outside the canonical Git LFS files in `weights/`.
 - Do not commit Roboflow/Kaggle API keys.
 - Do not commit `output/`, `runs/`, downloaded datasets, or generated inspection history.
-- Store training outputs and model artifacts in Google Drive or backend storage.
+- Store training outputs, experimental checkpoints, and old model artifacts in Google Drive or backend storage.
 
 ## More Details
 
