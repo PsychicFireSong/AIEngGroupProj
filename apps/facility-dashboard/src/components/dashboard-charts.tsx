@@ -41,6 +41,31 @@ const tooltipStyle = {
   border: "1px solid rgba(255,255,255,0.12)",
 };
 
+// ── Types for new analytics panels ───────────────────────────────────────────
+
+export type ClassSeverityRow = {
+  className: string;
+  minor: number;
+  moderate: number;
+  critical: number;
+  uncertain: number;
+};
+
+export type ClassConfidenceRow = {
+  className: string;
+  avgDetConf: number;   // Stage 1 average confidence (0-1)
+  avgSevConf: number;   // Stage 2 average severity confidence (0-1)
+  count: number;
+  uncertainRate: number; // fraction of detections that are uncertain/unknown
+};
+
+export type AreaCoverageRow = {
+  className: string;
+  avgArea: number;   // average areaRatio (0-1)
+  maxArea: number;
+  count: number;
+};
+
 export function SeverityPieChart({ data }: { data: SeverityDatum[] }) {
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -83,6 +108,137 @@ export function MetricBarChart({ data }: { data: MetricDatum[] }) {
             <Cell key={item.name} fill={item.color} />
           ))}
         </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+// ── Class × Severity cross-table ─────────────────────────────────────────────
+const SEV_COLS: { key: keyof Omit<ClassSeverityRow, "className">; label: string; color: string }[] = [
+  { key: "critical",  label: "Critical",  color: "#fb7185" },
+  { key: "moderate",  label: "Moderate",  color: "#facc15" },
+  { key: "minor",     label: "Minor",     color: "#2dd4bf" },
+  { key: "uncertain", label: "Uncertain", color: "#a78bfa" },
+];
+
+export function ClassSeverityTable({ rows }: { rows: ClassSeverityRow[] }) {
+  if (!rows.length) return (
+    <p className="py-6 text-center text-xs text-slate-500">No detections yet</p>
+  );
+  const total = (r: ClassSeverityRow) => r.critical + r.moderate + r.minor + r.uncertain;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="border-b border-white/10">
+            <th className="py-2 pr-4 text-left font-semibold text-slate-400">Defect class</th>
+            {SEV_COLS.map((c) => (
+              <th key={c.key} className="px-3 py-2 text-center font-semibold" style={{ color: c.color }}>
+                {c.label}
+              </th>
+            ))}
+            <th className="px-3 py-2 text-center font-semibold text-slate-400">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const t = total(row);
+            return (
+              <tr key={row.className} className="border-b border-white/5 hover:bg-white/[0.03]">
+                <td className="py-2 pr-4 font-medium text-slate-200 capitalize">{row.className.replace(/_/g, " ")}</td>
+                {SEV_COLS.map((c) => {
+                  const v = row[c.key];
+                  return (
+                    <td key={c.key} className="px-3 py-2 text-center">
+                      {v > 0 ? (
+                        <span className="inline-flex items-center justify-center rounded px-2 py-0.5 font-semibold" style={{ color: c.color, background: `${c.color}18` }}>
+                          {v}
+                        </span>
+                      ) : (
+                        <span className="text-slate-600">—</span>
+                      )}
+                    </td>
+                  );
+                })}
+                <td className="px-3 py-2 text-center font-semibold text-slate-300">{t}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Per-class confidence & uncertainty breakdown ───────────────────────────────
+function confidenceLabel(v: number) {
+  if (v >= 0.8) return { text: "Very confident", color: "#2dd4bf" };
+  if (v >= 0.6) return { text: "Fairly confident", color: "#86efac" };
+  if (v >= 0.4) return { text: "Moderate", color: "#facc15" };
+  return { text: "Low confidence", color: "#fb7185" };
+}
+
+export function ClassConfidencePanel({ rows }: { rows: ClassConfidenceRow[] }) {
+  if (!rows.length) return (
+    <p className="py-6 text-center text-xs text-slate-500">No detections yet</p>
+  );
+  return (
+    <div className="space-y-2">
+      {rows.map((row) => {
+        const overallConf = (row.avgDetConf + row.avgSevConf) / 2;
+        const label = confidenceLabel(overallConf);
+        const reviewCount = Math.round(row.uncertainRate * row.count);
+        return (
+          <div key={row.className} className="rounded-lg border border-white/[0.07] bg-white/[0.03] px-4 py-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-semibold text-slate-200 capitalize">{row.className.replace(/_/g, " ")}</span>
+              <span className="text-xs" style={{ color: label.color }}>{label.text}</span>
+            </div>
+            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+              <div className="h-full rounded-full transition-all" style={{ width: `${overallConf * 100}%`, background: label.color }} />
+            </div>
+            <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
+              <span>{row.count} detection{row.count !== 1 ? "s" : ""}</span>
+              {reviewCount > 0 ? (
+                <span className="text-amber-400">{reviewCount} may need a second look</span>
+              ) : (
+                <span className="text-slate-600">All clear</span>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Area coverage per class ───────────────────────────────────────────────────
+export function AreaCoverageChart({ rows }: { rows: AreaCoverageRow[] }) {
+  if (!rows.length) return (
+    <p className="py-6 text-center text-xs text-slate-500">No detections yet</p>
+  );
+  const data = rows.map((r) => ({
+    name: r.className.replace(/_/g, " "),
+    avg: parseFloat((r.avgArea * 100).toFixed(1)),
+    max: parseFloat((r.maxArea * 100).toFixed(1)),
+    count: r.count,
+  }));
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <BarChart data={data} layout="vertical" margin={{ top: 4, right: 48, bottom: 4, left: 4 }}>
+        <CartesianGrid stroke="rgba(255,255,255,0.07)" horizontal={false} />
+        <XAxis
+          type="number"
+          tickFormatter={(v) => `${v}%`}
+          tick={{ fill: "#94a3b8", fontSize: 11 }}
+          domain={[0, "dataMax + 5"]}
+        />
+        <YAxis type="category" dataKey="name" width={110} tick={{ fill: "#cbd5e1", fontSize: 11 }} />
+        <Tooltip
+          contentStyle={tooltipStyle}
+          formatter={(value, name) => [`${value}%`, name === "avg" ? "Avg area" : "Max area"]}
+        />
+        <Bar dataKey="avg" name="avg" fill="#38bdf8" radius={[0, 4, 4, 0]} label={{ position: "right", fill: "#94a3b8", fontSize: 11, formatter: (v: unknown) => `${v}%` }} />
       </BarChart>
     </ResponsiveContainer>
   );

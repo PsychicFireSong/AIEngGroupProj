@@ -34,6 +34,8 @@ import {
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
+import { SAMPLE_IMAGES } from "@/lib/sampleImages";
+import type { ClassSeverityRow, ClassConfidenceRow, AreaCoverageRow } from "@/components/dashboard-charts";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from "react";
 
@@ -51,6 +53,18 @@ const MetricBarChart = dynamic(
 );
 const ConditionTrendChart = dynamic(
   () => import("@/components/dashboard-charts").then((mod) => mod.ConditionTrendChart),
+  { ssr: false },
+);
+const ClassSeverityTable = dynamic(
+  () => import("@/components/dashboard-charts").then((mod) => mod.ClassSeverityTable),
+  { ssr: false },
+);
+const ClassConfidencePanel = dynamic(
+  () => import("@/components/dashboard-charts").then((mod) => mod.ClassConfidencePanel),
+  { ssr: false },
+);
+const AreaCoverageChart = dynamic(
+  () => import("@/components/dashboard-charts").then((mod) => mod.AreaCoverageChart),
   { ssr: false },
 );
 
@@ -607,6 +621,66 @@ function recommendationSummary(detections: Detection[]) {
   return { immediate, planned, monitor, manualReview };
 }
 
+function classSeverityData(detections: Detection[]): ClassSeverityRow[] {
+  const map = new Map<string, ClassSeverityRow>();
+  for (const d of detections) {
+    if (!map.has(d.className)) {
+      map.set(d.className, { className: d.className, minor: 0, moderate: 0, critical: 0, uncertain: 0 });
+    }
+    const row = map.get(d.className)!;
+    const sev = d.severity === "unknown" ? "uncertain" : d.severity;
+    if (sev === "minor" || sev === "moderate" || sev === "critical" || sev === "uncertain") {
+      row[sev] += 1;
+    } else {
+      row.uncertain += 1;
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => (b.critical + b.moderate) - (a.critical + a.moderate));
+}
+
+function classConfidenceData(detections: Detection[]): ClassConfidenceRow[] {
+  const acc = new Map<string, { sumDet: number; sumSev: number; count: number; uncertain: number }>();
+  for (const d of detections) {
+    if (!acc.has(d.className)) acc.set(d.className, { sumDet: 0, sumSev: 0, count: 0, uncertain: 0 });
+    const entry = acc.get(d.className)!;
+    entry.sumDet += d.confidence ?? 0;
+    entry.sumSev += d.severityConfidence ?? 0;
+    entry.count += 1;
+    if (d.severity === "uncertain" || d.severity === "unknown" || (d.confidence ?? 1) < 0.35) {
+      entry.uncertain += 1;
+    }
+  }
+  return Array.from(acc.entries())
+    .map(([className, e]): ClassConfidenceRow => ({
+      className,
+      avgDetConf: e.count ? e.sumDet / e.count : 0,
+      avgSevConf: e.count ? e.sumSev / e.count : 0,
+      count: e.count,
+      uncertainRate: e.count ? e.uncertain / e.count : 0,
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
+function areaCoverageData(detections: Detection[]): AreaCoverageRow[] {
+  const acc = new Map<string, { sum: number; max: number; count: number }>();
+  for (const d of detections) {
+    const area = d.areaRatio ?? 0;
+    if (!acc.has(d.className)) acc.set(d.className, { sum: 0, max: 0, count: 0 });
+    const entry = acc.get(d.className)!;
+    entry.sum += area;
+    if (area > entry.max) entry.max = area;
+    entry.count += 1;
+  }
+  return Array.from(acc.entries())
+    .map(([className, e]): AreaCoverageRow => ({
+      className,
+      avgArea: e.count ? e.sum / e.count : 0,
+      maxArea: e.max,
+      count: e.count,
+    }))
+    .sort((a, b) => b.avgArea - a.avgArea);
+}
+
 function previewForRecord(record: InspectionRecord) {
   return (
     record.evidenceImage ??
@@ -697,6 +771,9 @@ export function ControlRoom({ page }: { page: AppPage }) {
     [aggregateOverviewMode, history, latest],
   );
   const recommendationMetrics = useMemo(() => recommendationSummary(chartDetections), [chartDetections]);
+  const classSevData = useMemo(() => classSeverityData(chartDetections), [chartDetections]);
+  const classConfData = useMemo(() => classConfidenceData(chartDetections), [chartDetections]);
+  const areaData = useMemo(() => areaCoverageData(chartDetections), [chartDetections]);
 
   const trendData = useMemo(() => {
     if (history.length === 0) {
@@ -1959,6 +2036,54 @@ export function ControlRoom({ page }: { page: AppPage }) {
                     recommendationMetrics={recommendationMetrics}
                   />
                 ) : null}
+
+                {/* Class × Severity cross-table — always shown when detections exist */}
+                {chartDetections.length > 0 ? (
+                  <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+                    <div className="mb-3 flex items-center justify-between">
+                      <div>
+                        <h2 className="text-sm font-semibold text-white">What Was Found, and How Bad?</h2>
+                        <p className="mt-1 text-xs text-slate-400">
+                          For each type of defect, how many were minor, moderate, critical, or unclear.
+                        </p>
+                      </div>
+                      <ShieldAlert className="h-4 w-4 text-slate-400" />
+                    </div>
+                    <ClassSeverityTable rows={classSevData} />
+                  </div>
+                ) : null}
+
+                {analyticsMode && chartDetections.length > 0 ? (
+                  <>
+                    <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+                      <div className="mb-3 flex items-center justify-between">
+                        <div>
+                          <h2 className="text-sm font-semibold text-white">How Sure Was the AI?</h2>
+                          <p className="mt-1 text-xs text-slate-400">
+                            Overall confidence per defect type. Low-confidence detections may need a manual second look.
+                          </p>
+                        </div>
+                        <Gauge className="h-4 w-4 text-slate-400" />
+                      </div>
+                      <ClassConfidencePanel rows={classConfData} />
+                    </div>
+
+                    <div className="enterprise-panel border border-white/10 bg-[#111820] p-4">
+                      <div className="mb-3 flex items-center justify-between">
+                        <div>
+                          <h2 className="text-sm font-semibold text-white">How Large Are the Defects?</h2>
+                          <p className="mt-1 text-xs text-slate-400">
+                            Average portion of the image each defect type covers. Larger area often means more visible damage.
+                          </p>
+                        </div>
+                        <ZoomIn className="h-4 w-4 text-slate-400" />
+                      </div>
+                      <div className="h-[220px]">
+                        <AreaCoverageChart rows={areaData} />
+                      </div>
+                    </div>
+                  </>
+                ) : null}
               </section>
 
               <section
@@ -2111,6 +2236,34 @@ export function ControlRoom({ page }: { page: AppPage }) {
                     />
                   </div>
                 </div>
+                {SAMPLE_IMAGES.length > 0 ? (
+                  <div className="border-b border-white/10 bg-[#0b1016] px-4 py-3">
+                    <p className="mb-2 text-xs font-semibold uppercase tracking-[0.13em] text-slate-500">Try a sample image</p>
+                    <div className="flex flex-wrap gap-2">
+                      {SAMPLE_IMAGES.map((sample) => (
+                        <button
+                          key={sample.filename}
+                          type="button"
+                          className="group flex flex-col items-start rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-left transition hover:border-teal-300/30 hover:bg-teal-300/[0.05] active:scale-[0.97]"
+                          onClick={async () => {
+                            try {
+                              const res = await fetch(`/samples/${sample.filename}`);
+                              if (!res.ok) return;
+                              const blob = await res.blob();
+                              const file = new File([blob], sample.filename, { type: blob.type || "image/jpeg" });
+                              onUploadMedia(file);
+                            } catch {
+                              // silently ignore network errors
+                            }
+                          }}
+                        >
+                          <span className="text-xs font-semibold text-slate-200 group-hover:text-teal-100">{sample.label}</span>
+                          <span className="mt-0.5 text-[10px] text-slate-500 group-hover:text-teal-300/70">{sample.defectHint}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
                 {showLinkInput ? (
                   <div className="grid gap-3 border-b border-white/10 bg-[#0b1016] p-4 2xl:grid-cols-[minmax(0,1fr)_130px_120px_130px_auto]">
                     <input

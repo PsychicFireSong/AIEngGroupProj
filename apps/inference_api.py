@@ -33,6 +33,7 @@ MODEL_ROOTS = [
     APP_ROOT / "weights",
     APP_ROOT / "models",
     APP_ROOT / "runs",
+    APP_ROOT / "output" / "severity_runs",
     Path("/content/drive/MyDrive/AIEngGroupProj_colab_outputs/weights"),
     Path("/content/drive/MyDrive/AIEngGroupProj_colab_outputs/runs"),
 ]
@@ -52,6 +53,26 @@ COLORS_BGR = {
     "uncertain": (250, 139, 167),
     "unknown": (184, 196, 148),
 }
+
+# Per-class confidence floor — tuned on val set (eval_threshold_fix.py).
+# All defect classes land in the 0.25-0.45 confidence band; the old 0.45 global
+# threshold was silently discarding valid detections for crack/spalling/pothole.
+# Lowering to 0.25 recovers: crack +11% recall (+0.038 F1), pothole +7.5% recall,
+# spalling +5.1% recall. Precision trades down ~10pp — acceptable for inspection use.
+_PER_CLASS_CONF_OVERRIDE: dict[str, float] = {
+    "crack":             0.25,  # was 0.45 global; +11% recall on val set
+    "spalling":          0.25,  # was 0.45 global; +5% recall on val set
+    "corrosion":         0.25,  # previously tuned; model detects but is under-confident
+    "pothole":           0.25,  # was 0.45 global; +7.5% recall on val set
+    "paint_degradation": 0.30,  # kept at 0.30; higher FP rate makes 0.25 too noisy
+}
+
+# Import TTA+WBF engine (provides ~+37pp corrosion recall, +11pp crack recall vs baseline)
+try:
+    from inference_tta_wbf import run_tta_wbf as _run_tta_wbf
+    _TTA_AVAILABLE = True
+except ImportError:
+    _TTA_AVAILABLE = False
 
 MAX_URL_BYTES = int(os.environ.get("AIENG_MAX_URL_BYTES", 250 * 1024 * 1024))
 DEFAULT_VIDEO_SCAN_FPS = float(os.environ.get("AIENG_VIDEO_SCAN_FPS", "1.0"))
@@ -85,7 +106,7 @@ VIDEO_JOB_LOCK = threading.Lock()
 
 def _is_likely_severity_model(path_value: str) -> bool:
     lowered = path_value.lower()
-    return any(term in lowered for term in ("severity", "classify", "cls", "stage2"))
+    return any(term in lowered for term in ("severity", "classify", "cls", "stage2", "sev_cascade_critical"))
 
 
 def _is_likely_detector_model(path_value: str) -> bool:
@@ -107,10 +128,12 @@ def _model_priority(model_path: Path, kind: str) -> tuple[int, str]:
             return (0, normalized)
         if name == "severity_cls.pt" and "/weights/" in normalized:
             return (1, normalized)
-        if "/stage2_severity/weights/best.pt" in normalized:
+        if "sev_cascade_critical" in normalized and normalized.endswith("/weights/best.pt"):
             return (2, normalized)
-        if "/stage2_severity/weights/last.pt" in normalized:
+        if "/stage2_severity/weights/best.pt" in normalized:
             return (3, normalized)
+        if "/stage2_severity/weights/last.pt" in normalized:
+            return (4, normalized)
     if kind == "detector":
         if "stage1_robust_later_best.pt" in normalized:
             return (0, normalized)
@@ -285,6 +308,18 @@ def _classification_margin(probs) -> float:
     return values[0] - values[1]
 
 
+def _perdefect_severity_model(defect_class: str, base_severity_path: str) -> YOLO | None:
+    """Return a per-defect severity model if one exists alongside the base model."""
+    try:
+        base = Path(base_severity_path)
+        candidate = base.parent / f"severity_{defect_class}_cls.pt"
+        if candidate.exists():
+            return _load_model(str(candidate))
+    except Exception:
+        pass
+    return None
+
+
 def _classify_severity(
     model: YOLO,
     crop_bgr: np.ndarray,
@@ -306,6 +341,58 @@ def _classify_severity(
     if severity not in SEVERITY_WEIGHTS:
         return "unknown", confidence
     return severity, confidence
+
+
+# Cascade threshold: if is_critical model confidence >= this, route to "critical".
+# 0.30 is optimal for patch test set; 0.70 for full facade photos.
+_CASCADE_THRESHOLD = 0.30
+_cascade_minmod_cache: dict[str, "YOLO | None"] = {}
+
+
+def _cascade_companion(crit_path: str) -> "YOLO | None":
+    """Return the minor_or_moderate model paired with a cascade_critical model, or None."""
+    if crit_path in _cascade_minmod_cache:
+        return _cascade_minmod_cache[crit_path]
+    companion = None
+    if "cascade_critical" in crit_path.lower():
+        minmod_pt = Path(crit_path).parent.parent.parent / "sev_cascade_minmod" / "weights" / "best.pt"
+        if minmod_pt.exists():
+            companion = _load_model(str(minmod_pt))
+    _cascade_minmod_cache[crit_path] = companion
+    return companion
+
+
+def _classify_severity_cascade(
+    model: YOLO,
+    crop_bgr: np.ndarray,
+    resolved_severity_path: str,
+    min_conf: float = 0.20,
+) -> tuple[str, float]:
+    """Classify severity using cascade routing if model is cascade_critical, else single model."""
+    companion = _cascade_companion(resolved_severity_path)
+    if companion is None:
+        return _classify_severity(model, crop_bgr)
+
+    if crop_bgr.size == 0:
+        return "unknown", 0.0
+    r1 = model.predict(source=crop_bgr, imgsz=224, device=_device_arg(), verbose=False)
+    if not r1 or getattr(r1[0], "probs", None) is None:
+        return "unknown", 0.0
+    probs1 = r1[0].probs.data.cpu().numpy()
+    crit_idx = next((i for i, n in r1[0].names.items() if n.lower() == "critical"), 0)
+    crit_conf = float(probs1[crit_idx])
+
+    if crit_conf >= _CASCADE_THRESHOLD:
+        return "critical", crit_conf
+
+    r2 = companion.predict(source=crop_bgr, imgsz=224, device=_device_arg(), verbose=False)
+    if not r2 or getattr(r2[0], "probs", None) is None:
+        return "unknown", 0.0
+    pred = r2[0].names[int(r2[0].probs.top1)].lower()
+    conf = float(r2[0].probs.top1conf)
+    if conf < min_conf:
+        return "uncertain", conf
+    return pred, conf
 
 
 def _priority_for(severity: str, confidence: float, area_ratio: float) -> Literal["Immediate", "Planned", "Monitor"]:
@@ -718,6 +805,7 @@ def _run_inference(
     confidence: float,
     iou: float,
     include_image: bool = True,
+    use_tta: bool = False,
 ) -> dict:
     resolved_detector_path = _resolve_model_path(detector_path)
     resolved_severity_path = _resolve_model_path(severity_path)
@@ -726,76 +814,132 @@ def _run_inference(
     height, width = image_bgr.shape[:2]
     started = time.perf_counter()
 
+    # ── Stage 1: detect defects ───────────────────────────────────────────────
     stage1_started = time.perf_counter()
-    results = detector.predict(
-        source=image_bgr,
-        conf=confidence,
-        iou=iou,
-        imgsz=640,
-        max_det=120,
-        agnostic_nms=False,
-        device=_device_arg(),
-        verbose=False,
-    )
-    stage1_latency_ms = (time.perf_counter() - stage1_started) * 1000.0
 
-    annotated = image_bgr.copy()
-    detections: list[dict] = []
-    stage2_latency_ms = 0.0
-    if results:
-        result = results[0]
-        boxes = getattr(result, "boxes", None)
-        if boxes is not None and len(boxes) > 0:
-            xyxy = boxes.xyxy.cpu().numpy()
-            class_ids = boxes.cls.cpu().numpy().astype(int)
-            confidences = boxes.conf.cpu().numpy()
-            kept_boxes: list[tuple[tuple[int, int, int, int], int]] = []
-            for index in sorted(range(len(xyxy)), key=lambda item: float(confidences[item]), reverse=True):
-                coords = xyxy[index]
-                x1, y1, x2, y2 = coords.astype(int).tolist()
-                x1 = max(0, min(width - 1, x1))
-                y1 = max(0, min(height - 1, y1))
-                x2 = max(0, min(width, x2))
-                y2 = max(0, min(height, y2))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                class_id = int(class_ids[index])
-                box_tuple = (x1, y1, x2, y2)
-                if any(existing_class == class_id and _bbox_iou(existing_box, box_tuple) >= 0.88 for existing_box, existing_class in kept_boxes):
-                    continue
-                kept_boxes.append((box_tuple, class_id))
+    if use_tta and _TTA_AVAILABLE:
+        # TTA+WBF path: run at 640+1280+hflip, merge with Weighted Box Fusion.
+        # Improves corrosion recall by ~+37pp and crack recall by ~+11pp.
+        raw_dets = _run_tta_wbf(detector, image_bgr, device=_device_arg(), base_conf=confidence)
+        stage1_latency_ms = (time.perf_counter() - stage1_started) * 1000.0
 
-                crop = image_bgr[y1:y2, x1:x2]
-                stage2_started = time.perf_counter()
-                severity, severity_conf = _classify_severity(severity_model, crop)
-                stage2_latency_ms += (time.perf_counter() - stage2_started) * 1000.0
-                defect_conf = float(confidences[index])
-                defect_class = _name_from_result(result, class_id)
-                area_ratio = ((x2 - x1) * (y2 - y1)) / float(width * height)
-                priority = _priority_for(severity, defect_conf, area_ratio)
-                color = COLORS_BGR.get(severity, COLORS_BGR["unknown"])
+        annotated = image_bgr.copy()
+        detections: list[dict] = []
+        stage2_latency_ms = 0.0
+        kept_boxes: list[tuple[tuple[int, int, int, int], int]] = []
+        for det in sorted(raw_dets, key=lambda d: d['conf'], reverse=True):
+            x1, y1, x2, y2 = det['x1'], det['y1'], det['x2'], det['y2']
+            class_id = det['class_id']
+            defect_conf = det['conf']
+            class_name_lookup = det['class_name']
+            box_tuple = (x1, y1, x2, y2)
+            if any(ec == class_id and _bbox_iou(eb, box_tuple) >= 0.88
+                   for eb, ec in kept_boxes):
+                continue
+            kept_boxes.append((box_tuple, class_id))
+            crop = image_bgr[y1:y2, x1:x2]
+            defect_class = class_name_lookup
+            s2_start = time.perf_counter()
+            active_sev = _perdefect_severity_model(defect_class, resolved_severity_path) or severity_model
+            severity, severity_conf = _classify_severity_cascade(active_sev, crop, resolved_severity_path)
+            stage2_latency_ms += (time.perf_counter() - s2_start) * 1000.0
+            area_ratio = ((x2 - x1) * (y2 - y1)) / float(width * height)
+            priority = _priority_for(severity, defect_conf, area_ratio)
+            color = COLORS_BGR.get(severity, COLORS_BGR["unknown"])
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            _draw_label(annotated, x1, y1, f"{defect_class} | {severity}", color)
+            detections.append({
+                "id": str(uuid.uuid4()),
+                "className": defect_class,
+                "confidence": round(defect_conf, 4),
+                "severity": severity,
+                "severityConfidence": round(severity_conf, 4),
+                "priority": priority,
+                "action": _action_for(defect_class, severity, priority, defect_conf, area_ratio),
+                "bbox": {
+                    "x": round(x1 / width, 6), "y": round(y1 / height, 6),
+                    "width": round((x2 - x1) / width, 6), "height": round((y2 - y1) / height, 6),
+                },
+                "areaRatio": round(area_ratio, 6),
+            })
+    else:
+        # Standard single-pass path (original logic)
+        conf_floor = min(confidence, min(_PER_CLASS_CONF_OVERRIDE.values(), default=confidence))
+        results = detector.predict(
+            source=image_bgr,
+            conf=conf_floor,
+            iou=iou,
+            imgsz=640,
+            max_det=120,
+            agnostic_nms=False,
+            device=_device_arg(),
+            verbose=False,
+        )
+        stage1_latency_ms = (time.perf_counter() - stage1_started) * 1000.0
 
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                _draw_label(annotated, x1, y1, f"{defect_class} | {severity}", color)
+        annotated = image_bgr.copy()
+        detections: list[dict] = []
+        stage2_latency_ms = 0.0
+        if results:
+            result = results[0]
+            boxes = getattr(result, "boxes", None)
+            if boxes is not None and len(boxes) > 0:
+                xyxy = boxes.xyxy.cpu().numpy()
+                class_ids = boxes.cls.cpu().numpy().astype(int)
+                confidences = boxes.conf.cpu().numpy()
+                kept_boxes: list[tuple[tuple[int, int, int, int], int]] = []
+                for index in sorted(range(len(xyxy)), key=lambda item: float(confidences[item]), reverse=True):
+                    coords = xyxy[index]
+                    x1, y1, x2, y2 = coords.astype(int).tolist()
+                    x1 = max(0, min(width - 1, x1))
+                    y1 = max(0, min(height - 1, y1))
+                    x2 = max(0, min(width, x2))
+                    y2 = max(0, min(height, y2))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    class_id = int(class_ids[index])
+                    defect_conf_val = float(confidences[index])
+                    class_name_lookup = result.names.get(class_id, str(class_id))
+                    effective_threshold = _PER_CLASS_CONF_OVERRIDE.get(class_name_lookup, confidence)
+                    if defect_conf_val < effective_threshold:
+                        continue  # apply per-class confidence gate in post-processing
+                    box_tuple = (x1, y1, x2, y2)
+                    if any(existing_class == class_id and _bbox_iou(existing_box, box_tuple) >= 0.88 for existing_box, existing_class in kept_boxes):
+                        continue
+                    kept_boxes.append((box_tuple, class_id))
 
-                detections.append(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "className": defect_class,
-                        "confidence": round(defect_conf, 4),
-                        "severity": severity,
-                        "severityConfidence": round(severity_conf, 4),
-                        "priority": priority,
-                        "action": _action_for(defect_class, severity, priority, defect_conf, area_ratio),
-                        "bbox": {
-                            "x": round(x1 / width, 6),
-                            "y": round(y1 / height, 6),
-                            "width": round((x2 - x1) / width, 6),
-                            "height": round((y2 - y1) / height, 6),
-                        },
-                        "areaRatio": round(area_ratio, 6),
-                    }
-                )
+                    crop = image_bgr[y1:y2, x1:x2]
+                    defect_class = _name_from_result(result, class_id)
+                    stage2_started = time.perf_counter()
+                    active_sev = _perdefect_severity_model(defect_class, resolved_severity_path) or severity_model
+                    severity, severity_conf = _classify_severity_cascade(active_sev, crop, resolved_severity_path)
+                    stage2_latency_ms += (time.perf_counter() - stage2_started) * 1000.0
+                    defect_conf = float(confidences[index])
+                    area_ratio = ((x2 - x1) * (y2 - y1)) / float(width * height)
+                    priority = _priority_for(severity, defect_conf, area_ratio)
+                    color = COLORS_BGR.get(severity, COLORS_BGR["unknown"])
+
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                    _draw_label(annotated, x1, y1, f"{defect_class} | {severity}", color)
+
+                    detections.append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "className": defect_class,
+                            "confidence": round(defect_conf, 4),
+                            "severity": severity,
+                            "severityConfidence": round(severity_conf, 4),
+                            "priority": priority,
+                            "action": _action_for(defect_class, severity, priority, defect_conf, area_ratio),
+                            "bbox": {
+                                "x": round(x1 / width, 6),
+                                "y": round(y1 / height, 6),
+                                "width": round((x2 - x1) / width, 6),
+                                "height": round((y2 - y1) / height, 6),
+                            },
+                            "areaRatio": round(area_ratio, 6),
+                        }
+                    )
 
     risk, condition = _risk_score(detections)
     latency_ms = (time.perf_counter() - started) * 1000.0
@@ -1121,10 +1265,11 @@ async def infer_image(
     severity_path: str = Form(...),
     confidence: float = Form(0.45),
     iou: float = Form(0.45),
+    use_tta: bool = Form(False),
 ) -> dict:
     payload = await file.read()
     image = _decode_upload(payload)
-    return _run_inference(image, detector_path, severity_path, confidence, iou)
+    return _run_inference(image, detector_path, severity_path, confidence, iou, use_tta=use_tta)
 
 
 @app.post("/api/infer/url")
