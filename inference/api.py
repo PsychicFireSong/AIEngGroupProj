@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
@@ -313,18 +313,6 @@ def _name_from_result(result, class_id: int) -> str:
     return str(class_id)
 
 
-def _classification_margin(probs) -> float:
-    try:
-        values = probs.top5conf
-        if hasattr(values, "cpu"):
-            values = values.cpu().numpy()
-        values = [float(value) for value in values]
-    except Exception:
-        return float(probs.top1conf)
-    if len(values) < 2:
-        return values[0] if values else 0.0
-    return values[0] - values[1]
-
 
 def _perdefect_severity_model(defect_class: str, base_severity_path: str) -> YOLO | None:
     """Return a per-defect severity model if one exists alongside the base model."""
@@ -342,7 +330,6 @@ def _classify_severity(
     model: YOLO,
     crop_bgr: np.ndarray,
     min_conf: float = 0.40,
-    min_margin: float = 0.08,
 ) -> tuple[str, float]:
     if crop_bgr.size == 0:
         return "unknown", 0.0
@@ -353,9 +340,6 @@ def _classify_severity(
     probs = result.probs
     severity = _name_from_result(result, int(probs.top1)).lower()
     confidence = float(probs.top1conf)
-    margin = _classification_margin(probs)
-    if confidence < min_conf or margin < min_margin:
-        return "uncertain", confidence
     if severity not in SEVERITY_WEIGHTS:
         return "unknown", confidence
     return severity, confidence
@@ -384,7 +368,6 @@ def _classify_severity_cascade(
     model: YOLO,
     crop_bgr: np.ndarray,
     resolved_severity_path: str,
-    min_conf: float = 0.20,
 ) -> tuple[str, float]:
     """Classify severity using cascade routing if model is cascade_critical, else single model."""
     companion = _cascade_companion(resolved_severity_path)
@@ -408,8 +391,6 @@ def _classify_severity_cascade(
         return "unknown", 0.0
     pred = r2[0].names[int(r2[0].probs.top1)].lower()
     conf = float(r2[0].probs.top1conf)
-    if conf < min_conf:
-        return "uncertain", conf
     return pred, conf
 
 
@@ -824,6 +805,7 @@ def _run_inference(
     iou: float,
     include_image: bool = True,
     use_tta: bool = False,
+    agnostic_nms: bool = False,
 ) -> dict:
     resolved_detector_path = _resolve_model_path(detector_path)
     resolved_severity_path = _resolve_model_path(severity_path)
@@ -889,7 +871,7 @@ def _run_inference(
             iou=iou,
             imgsz=640,
             max_det=120,
-            agnostic_nms=False,
+            agnostic_nms=agnostic_nms,
             device=_device_arg(),
             verbose=False,
         )
@@ -981,19 +963,20 @@ def _run_inference(
 
 
 def _analyze_media_url(
-    media_url: str,
-    detector_path: str,
-    severity_path: str,
+    media_url: str = "",
+    detector_path: str = "",
+    severity_path: str = "",
     confidence: float = 0.45,
     iou: float = 0.45,
     frame_time_sec: float = 0.0,
     scan_video: bool = True,
     scan_fps: float = DEFAULT_VIDEO_SCAN_FPS,
     review_confidence: float = 0.18,
+    local_video_path: Optional[str] = None,
     progress_callback=None,
     cancel_requested=None,
 ) -> dict:
-    if not media_url.startswith(("http://", "https://")):
+    if not local_video_path and not media_url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Media URL must start with http:// or https://.")
 
     def update_progress(**fields) -> None:
@@ -1012,7 +995,10 @@ def _analyze_media_url(
 
     update_progress(progress=2, stage="resolving", message="Resolving linked media and preparing frame sampling.")
     check_cancelled()
-    frames = _frames_from_media_url(media_url, requested_frame_time, requested_scan_fps, scan_video)
+    if local_video_path:
+        frames = _frames_from_video_file(Path(local_video_path), requested_frame_time, requested_scan_fps, True)
+    else:
+        frames = _frames_from_media_url(media_url, requested_frame_time, requested_scan_fps, scan_video)
     total_frames = max(1, len(frames))
     update_progress(
         progress=8,
@@ -1161,6 +1147,14 @@ def _analyze_media_url(
 
 
 def _run_video_job(job_id: str, params: dict) -> None:
+    local_path = params.get("local_video_path")
+    # delete_after_job=False for sample files that must not be removed after analysis
+    delete_after = params.pop("delete_after_job", True)
+
+    def _cleanup():
+        if local_path and delete_after:
+            Path(local_path).unlink(missing_ok=True)
+
     if _video_job_cancel_requested(job_id):
         _update_video_job(
             job_id,
@@ -1171,6 +1165,7 @@ def _run_video_job(job_id: str, params: dict) -> None:
             finishedAt=_now_iso(),
             finishedMonotonic=time.monotonic(),
         )
+        _cleanup()
         return
 
     _update_video_job(
@@ -1197,6 +1192,7 @@ def _run_video_job(job_id: str, params: dict) -> None:
             finishedAt=_now_iso(),
             finishedMonotonic=time.monotonic(),
         )
+        _cleanup()
         return
     except HTTPException as exc:
         _update_video_job(
@@ -1209,6 +1205,7 @@ def _run_video_job(job_id: str, params: dict) -> None:
             finishedAt=_now_iso(),
             finishedMonotonic=time.monotonic(),
         )
+        _cleanup()
         return
     except Exception as exc:  # pragma: no cover - defensive runtime guard
         _update_video_job(
@@ -1221,6 +1218,7 @@ def _run_video_job(job_id: str, params: dict) -> None:
             finishedAt=_now_iso(),
             finishedMonotonic=time.monotonic(),
         )
+        _cleanup()
         return
 
     _update_video_job(
@@ -1236,6 +1234,7 @@ def _run_video_job(job_id: str, params: dict) -> None:
         positiveFrames=result.get("source", {}).get("positiveFrameCount"),
         returnedDefectFrames=result.get("source", {}).get("returnedDefectFrames"),
     )
+    _cleanup()
 
 
 @app.get("/health")
@@ -1299,10 +1298,11 @@ async def infer_image(
     confidence: float = Form(0.45),
     iou: float = Form(0.45),
     use_tta: bool = Form(False),
+    agnostic_nms: bool = Form(False),
 ) -> dict:
     payload = await file.read()
     image = _decode_upload(payload)
-    return _run_inference(image, detector_path, severity_path, confidence, iou, use_tta=use_tta)
+    return _run_inference(image, detector_path, severity_path, confidence, iou, use_tta=use_tta, agnostic_nms=agnostic_nms)
 
 
 @app.post("/api/infer/url")
@@ -1370,6 +1370,136 @@ async def submit_video_job(
             "stage": "queued",
             "message": "Video analysis queued.",
             "mediaUrl": media_url,
+            "createdAt": _now_iso(),
+            "updatedAt": _now_iso(),
+            "createdMonotonic": time.monotonic(),
+            "totalFrames": None,
+            "processedFrames": 0,
+            "positiveFrames": 0,
+            "returnedDefectFrames": 0,
+            "scanFps": round(max(0.05, min(float(scan_fps or DEFAULT_VIDEO_SCAN_FPS), MAX_VIDEO_SCAN_FPS)), 3),
+            "cancelRequested": False,
+        }
+        VIDEO_JOBS[job_id] = job
+        future = VIDEO_JOB_EXECUTOR.submit(_run_video_job, job_id, params)
+        job["future"] = future
+        return _job_public_snapshot(job)
+
+
+@app.post("/api/jobs/video/upload")
+async def submit_video_upload_job(
+    video_file: UploadFile = File(...),
+    detector_path: str = Form(...),
+    severity_path: str = Form(...),
+    confidence: float = Form(0.45),
+    iou: float = Form(0.45),
+    frame_time_sec: float = Form(0.0),
+    scan_fps: float = Form(DEFAULT_VIDEO_SCAN_FPS),
+    review_confidence: float = Form(0.18),
+) -> dict:
+    _resolve_model_path(detector_path)
+    _resolve_model_path(severity_path)
+
+    with VIDEO_JOB_LOCK:
+        if _active_video_job_count_locked() >= MAX_VIDEO_JOBS:
+            raise HTTPException(status_code=429, detail=f"Video queue is full. Maximum active jobs: {MAX_VIDEO_JOBS}.")
+
+    content = await video_file.read()
+    suffix = Path(video_file.filename or "video.mp4").suffix or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        tmp_path = handle.name
+        handle.write(content)
+
+    with VIDEO_JOB_LOCK:
+        if _active_video_job_count_locked() >= MAX_VIDEO_JOBS:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise HTTPException(status_code=429, detail=f"Video queue is full. Maximum active jobs: {MAX_VIDEO_JOBS}.")
+
+        job_id = str(uuid.uuid4())
+        params = {
+            "local_video_path": tmp_path,
+            "media_url": "",
+            "detector_path": detector_path,
+            "severity_path": severity_path,
+            "confidence": confidence,
+            "iou": iou,
+            "frame_time_sec": frame_time_sec,
+            "scan_video": True,
+            "scan_fps": scan_fps,
+            "review_confidence": review_confidence,
+        }
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "stage": "queued",
+            "message": "Video upload queued for analysis.",
+            "mediaUrl": f"[uploaded: {video_file.filename}]",
+            "createdAt": _now_iso(),
+            "updatedAt": _now_iso(),
+            "createdMonotonic": time.monotonic(),
+            "totalFrames": None,
+            "processedFrames": 0,
+            "positiveFrames": 0,
+            "returnedDefectFrames": 0,
+            "scanFps": round(max(0.05, min(float(scan_fps or DEFAULT_VIDEO_SCAN_FPS), MAX_VIDEO_SCAN_FPS)), 3),
+            "cancelRequested": False,
+        }
+        VIDEO_JOBS[job_id] = job
+        future = VIDEO_JOB_EXECUTOR.submit(_run_video_job, job_id, params)
+        job["future"] = future
+        return _job_public_snapshot(job)
+
+
+_SAMPLES_DIR = APP_ROOT / "apps" / "facility-dashboard" / "public" / "samples"
+_ALLOWED_SAMPLE_VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
+
+
+@app.post("/api/jobs/video/local-sample")
+async def submit_video_local_sample_job(
+    sample_name: str = Form(...),
+    detector_path: str = Form(...),
+    severity_path: str = Form(...),
+    confidence: float = Form(0.45),
+    iou: float = Form(0.45),
+    frame_time_sec: float = Form(0.0),
+    scan_fps: float = Form(DEFAULT_VIDEO_SCAN_FPS),
+    review_confidence: float = Form(0.18),
+) -> dict:
+    safe_name = Path(sample_name).name  # strip any path traversal
+    if Path(safe_name).suffix.lower() not in _ALLOWED_SAMPLE_VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"'{safe_name}' is not a supported video file.")
+    local_path = _SAMPLES_DIR / safe_name
+    if not local_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Sample '{safe_name}' not found.")
+    _resolve_model_path(detector_path)
+    _resolve_model_path(severity_path)
+
+    with VIDEO_JOB_LOCK:
+        if _active_video_job_count_locked() >= MAX_VIDEO_JOBS:
+            raise HTTPException(status_code=429, detail=f"Video queue is full. Maximum active jobs: {MAX_VIDEO_JOBS}.")
+
+        job_id = str(uuid.uuid4())
+        params = {
+            "local_video_path": str(local_path),
+            "delete_after_job": False,  # never delete bundled sample files
+            "media_url": f"[sample: {safe_name}]",
+            "detector_path": detector_path,
+            "severity_path": severity_path,
+            "confidence": confidence,
+            "iou": iou,
+            "frame_time_sec": frame_time_sec,
+            "scan_video": True,
+            "scan_fps": scan_fps,
+            "review_confidence": review_confidence,
+        }
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "stage": "queued",
+            "message": f"Sample '{safe_name}' queued for analysis.",
+            "mediaUrl": f"[sample: {safe_name}]",
             "createdAt": _now_iso(),
             "updatedAt": _now_iso(),
             "createdMonotonic": time.monotonic(),

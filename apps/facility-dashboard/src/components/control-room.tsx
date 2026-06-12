@@ -204,6 +204,7 @@ type Settings = {
   confidence: number;
   iou: number;
   frameIntervalMs: number;
+  agnosticNms: boolean;
   detectorPath: string;
   severityPath: string;
 };
@@ -253,6 +254,7 @@ const balancedSettings: Omit<Settings, "detectorPath" | "severityPath"> = {
   confidence: 0.3,
   iou: 0.45,
   frameIntervalMs: 900,
+  agnosticNms: false,
 };
 
 const modeSettings: Record<Settings["mode"], Omit<Settings, "mode" | "detectorPath" | "severityPath">> = {
@@ -260,21 +262,25 @@ const modeSettings: Record<Settings["mode"], Omit<Settings, "mode" | "detectorPa
     confidence: 0.25,
     iou: 0.45,
     frameIntervalMs: 500,
+    agnosticNms: false,
   },
   Balanced: {
     confidence: 0.3,
     iou: 0.45,
     frameIntervalMs: 900,
+    agnosticNms: false,
   },
   "High accuracy": {
     confidence: 0.45,
     iou: 0.38,
     frameIntervalMs: 1500,
+    agnosticNms: false,
   },
   "Multi-defect review": {
     confidence: 0.1,
     iou: 0.55,
     frameIntervalMs: 1200,
+    agnosticNms: false,
   },
 };
 
@@ -545,6 +551,12 @@ function singleFrameSummary(result: InferenceResult): VideoFrameSummary | null {
   };
 }
 
+function isReplayableUrl(url?: string): boolean {
+  if (!url || url.startsWith("blob:")) return false;
+  if (url.includes("youtube.com") || url.includes("youtu.be")) return false;
+  return true;
+}
+
 function detectionsForRecord(record: InspectionRecord): Detection[] {
   const frameDetections =
     record.source === "video"
@@ -697,11 +709,14 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const intervalRef = useRef<number | null>(null);
+  const scanningRef = useRef(false);
+  const lastLatencyRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const videoSessionIdRef = useRef<string>("");
   const completedVideoJobIdsRef = useRef<Set<string>>(new Set());
   const uploadMediaRef = useRef<((file: File | undefined) => Promise<void>) | null>(null);
+  const loadVideoJobResultRef = useRef<((job: VideoJob) => void) | null>(null);
   const monitorRef = useRef<HTMLDivElement | null>(null);
   const analyticsRef = useRef<HTMLDivElement | null>(null);
   const historyRef = useRef<HTMLDivElement | null>(null);
@@ -721,10 +736,12 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const [paletteName, setPaletteName] = useState<PaletteName>("Signal");
   const [monitorPanel, setMonitorPanel] = useState<MonitorPanel>("findings");
   const [cameraActive, setCameraActive] = useState(false);
+  const [backendWaking, setBackendWaking] = useState(false);
   const [cameraMessage, setCameraMessage] = useState("Camera preview is off.");
   const [cameraError, setCameraError] = useState("");
   const [scanning, setScanning] = useState(false);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [sourceType, setSourceType] = useState<InspectionRecord["source"]>("camera");
   const [imagePreview, setImagePreview] = useState<string>("");
   const [videoObjectUrl, setVideoObjectUrl] = useState<string>("");
@@ -744,11 +761,20 @@ export function ControlRoom({ page }: { page: AppPage }) {
   const [analysisElapsedSec, setAnalysisElapsedSec] = useState(0);
   const [dragActive, setDragActive] = useState(false);
   const [riskInfoOpen, setRiskInfoOpen] = useState(false);
+  const [videoCurrentTime, setVideoCurrentTime] = useState(0);
+  const framesListRef = useRef<HTMLDivElement | null>(null);
 
   const detectorModels = models.filter((model) => model.kind === "detector");
   const severityModels = models.filter((model) => model.kind === "severity");
   const selectedDetection = latest.detections.find((item) => item.id === selectedDetectionId) ?? latest.detections[0];
   const latestDefectFrames = useMemo(() => defectFrameSummaries(latest), [latest]);
+  const activeVideoFrame = useMemo(
+    () =>
+      sourceType === "video" && videoObjectUrl
+        ? latestDefectFrames.find((f) => Math.abs(f.frameTimeSec - videoCurrentTime) < 0.5) ?? null
+        : null,
+    [sourceType, videoObjectUrl, latestDefectFrames, videoCurrentTime],
+  );
   const videoJobId = videoJob?.id ?? "";
   const activeVideoJob = videoJob?.status === "queued" || videoJob?.status === "running";
   const themeStyle = useMemo(() => dashboardThemeStyle(themeMode, paletteName), [themeMode, paletteName]);
@@ -846,7 +872,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
         setSelectedDetectionId(restored.detections[0]?.id ?? "");
         setSourceType("image");
         setVideoObjectUrl((current) => {
-          if (current) URL.revokeObjectURL(current);
+          if (current && current.startsWith("blob:")) URL.revokeObjectURL(current);
           return "";
         });
         setImagePreview(payload.imagePreview ?? restored.evidenceImage ?? restored.annotatedImage ?? "");
@@ -907,8 +933,9 @@ export function ControlRoom({ page }: { page: AppPage }) {
   }, []);
 
   const stopScanning = useCallback(() => {
+    scanningRef.current = false;
     if (intervalRef.current) {
-      window.clearInterval(intervalRef.current);
+      window.clearTimeout(intervalRef.current);
       intervalRef.current = null;
     }
     setScanning(false);
@@ -1062,7 +1089,9 @@ export function ControlRoom({ page }: { page: AppPage }) {
     formData.append("severity_path", settings.severityPath);
     formData.append("confidence", String(settings.confidence));
     formData.append("iou", String(settings.iou));
+    formData.append("agnostic_nms", String(settings.agnosticNms));
 
+    busyRef.current = true;
     setBusy(true);
     try {
       const response = await fetch(`${API_BASE}/api/infer/image`, {
@@ -1073,6 +1102,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
         throw new Error(await response.text());
       }
       const payload = normalizeResult((await response.json()) as InferenceResult);
+      lastLatencyRef.current = payload.latencyMs ?? 0;
       setLatest(payload);
       setSelectedDetectionId(payload.detections[0]?.id ?? "");
       setMonitorPanel("findings");
@@ -1083,6 +1113,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
     } catch {
       setApiMessage("Inference failed. Check model paths and backend logs.");
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -1149,7 +1180,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
     setSourceType("image");
     setImagePreview("");
     setVideoObjectUrl((current) => {
-      if (current) URL.revokeObjectURL(current);
+      if (current && current.startsWith("blob:")) URL.revokeObjectURL(current);
       return "";
     });
     setLatest(emptyInferenceResult());
@@ -1198,6 +1229,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
   };
 
   const runCurrentFrameOnce = async () => {
+    if (busyRef.current) return;
     const blob = await captureCurrentFrameBlob();
     if (blob) {
       await inferBlob(blob, sourceType === "video" ? "video" : "camera");
@@ -1207,16 +1239,34 @@ export function ControlRoom({ page }: { page: AppPage }) {
   };
 
   const startSamplingLoop = () => {
-    if (intervalRef.current) {
-      window.clearInterval(intervalRef.current);
-    }
-    window.setTimeout(() => {
-      void runCurrentFrameOnce();
-    }, 500);
-    intervalRef.current = window.setInterval(() => {
-      void runCurrentFrameOnce();
-    }, settings.frameIntervalMs);
+    scanningRef.current = true;
+    if (intervalRef.current) window.clearTimeout(intervalRef.current);
+    const tick = async () => {
+      if (!scanningRef.current) return;
+      await runCurrentFrameOnce();
+      if (!scanningRef.current) return;
+      // GPU (<300 ms per frame): fire next frame after a 50 ms gap → ~10 fps smooth overlay
+      // CPU (>300 ms): busy guard in runCurrentFrameOnce prevents overlap; 50 ms reschedule
+      //   means it retries every 50 ms until the previous inference finishes, then runs.
+      intervalRef.current = window.setTimeout(tick, 50);
+    };
+    intervalRef.current = window.setTimeout(tick, 400);
     setScanning(true);
+  };
+
+  const waitForBackend = async (): Promise<boolean> => {
+    setBackendWaking(true);
+    setCameraMessage("Backend is starting up — this can take ~30 s on first use.");
+    for (let i = 0; i < 8; i++) {
+      await new Promise<void>((res) => setTimeout(res, 8000));
+      try {
+        const r = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(4000) });
+        if (r.ok) { setBackendWaking(false); return true; }
+      } catch {}
+    }
+    setBackendWaking(false);
+    setCameraMessage("Backend did not respond. Check that the inference service is running.");
+    return false;
   };
 
   const toggleLiveMonitoring = async () => {
@@ -1233,6 +1283,15 @@ export function ControlRoom({ page }: { page: AppPage }) {
       startSamplingLoop();
       setApiMessage("Video scan active. The visible frame is sampled repeatedly.");
       return;
+    }
+
+    // Quick health check — if backend is sleeping (e.g. HF Spaces cold start), wait for it
+    try {
+      const r = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });
+      if (!r.ok) throw new Error("unhealthy");
+    } catch {
+      const ready = await waitForBackend();
+      if (!ready) return;
     }
 
     const opened = await startCamera();
@@ -1254,17 +1313,59 @@ export function ControlRoom({ page }: { page: AppPage }) {
       setSourceType("video");
       setImagePreview("");
       setVideoObjectUrl((current) => {
-        if (current) URL.revokeObjectURL(current);
+        if (current && current.startsWith("blob:")) URL.revokeObjectURL(current);
         return preview;
       });
-      setCameraMessage("Video evidence loaded. Use Analyze frame once, or Scan video to sample visible playback frames.");
-      setApiMessage("Video loaded. Sampling uses the visible frame in the center evidence viewport.");
+      setWorkspaceView("monitor");
+
+      if (settings.detectorPath && settings.severityPath && apiOnline) {
+        if (activeVideoJob) {
+          setApiMessage("A video analysis job is already running. Cancel it first, then re-select the video.");
+          setCameraMessage("Video loaded — cancel the active job first to scan this video.");
+          return;
+        }
+        try {
+          const formData = new FormData();
+          formData.append("video_file", file);
+          formData.append("detector_path", settings.detectorPath);
+          formData.append("severity_path", settings.severityPath);
+          formData.append("confidence", String(settings.confidence));
+          formData.append("iou", String(settings.iou));
+          formData.append("frame_time_sec", "0");
+          formData.append("scan_fps", String(linkScanFps));
+          formData.append("review_confidence", String(Math.min(settings.confidence, 0.18)));
+          const response = await fetch(`${API_BASE}/api/jobs/video/upload`, {
+            method: "POST",
+            body: formData,
+          });
+          if (!response.ok) {
+            const detail = await response.text();
+            throw new Error(detail);
+          }
+          const job = (await response.json()) as VideoJob;
+          setVideoJob(job);
+          setMonitorPanel("frames");
+          setApiMessage(`Video queued for full scan (job ${job.id.slice(0, 8)}). Detected frames will appear as analysis runs.`);
+          setCameraMessage("Video loaded and scan queued. Results will populate the frames panel.");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Failed to queue video scan.";
+          setApiMessage(message.slice(0, 180));
+          setCameraMessage("Video loaded. Use Analyze frame or Scan video to inspect manually.");
+        }
+      } else {
+        setCameraMessage("Video loaded. Use Analyze frame once, or Scan video to sample visible playback frames.");
+        setApiMessage(
+          !apiOnline
+            ? "Inference API is offline — video loaded for manual inspection only."
+            : "Configure detector and severity models in Settings, then re-upload to auto-scan.",
+        );
+      }
       return;
     }
 
     setSourceType("image");
     setVideoObjectUrl((current) => {
-      if (current) URL.revokeObjectURL(current);
+      if (current && current.startsWith("blob:")) URL.revokeObjectURL(current);
       return "";
     });
     setImagePreview(preview);
@@ -1273,7 +1374,64 @@ export function ControlRoom({ page }: { page: AppPage }) {
 
   useEffect(() => {
     uploadMediaRef.current = onUploadMedia;
+    loadVideoJobResultRef.current = loadVideoJobResult;
   });
+
+  // Submit a bundled sample video directly via local-sample endpoint (no blob roundtrip)
+  const triggerSampleVideoJob = async (filename: string, label: string) => {
+    stopCamera();
+    stopScanning();
+    setLatest(emptyInferenceResult());
+    setSelectedDetectionId("");
+    videoSessionIdRef.current = crypto.randomUUID();
+    setSourceType("video");
+    setImagePreview("");
+    setVideoObjectUrl((current) => {
+      if (current && current.startsWith("blob:")) URL.revokeObjectURL(current);
+      return `/samples/${filename}`;
+    });
+    setWorkspaceView("monitor");
+
+    if (!settings.detectorPath || !settings.severityPath || !apiOnline) {
+      setCameraMessage("Video loaded. Configure models in Settings to enable automatic detection.");
+      setApiMessage(
+        !apiOnline
+          ? "Inference API offline — video loaded for manual inspection only."
+          : "Configure detector and severity models in Settings, then re-select to auto-scan.",
+      );
+      return;
+    }
+    if (activeVideoJob) {
+      setApiMessage("A video analysis job is already running. Cancel it first, then re-select the video.");
+      setCameraMessage("Video loaded — cancel the active job first to scan.");
+      return;
+    }
+    try {
+      const formData = new FormData();
+      formData.append("sample_name", filename);
+      formData.append("detector_path", settings.detectorPath);
+      formData.append("severity_path", settings.severityPath);
+      formData.append("confidence", String(settings.confidence));
+      formData.append("iou", String(settings.iou));
+      formData.append("frame_time_sec", "0");
+      formData.append("scan_fps", String(linkScanFps));
+      formData.append("review_confidence", String(Math.min(settings.confidence, 0.18)));
+      const response = await fetch(`${API_BASE}/api/jobs/video/local-sample`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const job = (await response.json()) as VideoJob;
+      setVideoJob(job);
+      setMonitorPanel("frames");
+      setApiMessage(`"${label}" queued (job ${job.id.slice(0, 8)}). Detected frames will appear as analysis runs.`);
+      setCameraMessage("Video loaded and scan queued — results populate automatically when complete.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to queue video scan.";
+      setApiMessage(message.slice(0, 180));
+      setCameraMessage("Video loaded. Use Scan video to run detection manually.");
+    }
+  };
 
   const isFileDrag = (event: DragEvent<HTMLElement>) => Array.from(event.dataTransfer.types).includes("Files");
 
@@ -1351,7 +1509,23 @@ export function ControlRoom({ page }: { page: AppPage }) {
     };
   }, []);
 
+  useEffect(() => {
+    if (!activeVideoFrame || !framesListRef.current) return;
+    const el = framesListRef.current.querySelector<HTMLElement>(`[data-frame-id="${activeVideoFrame.id}"]`);
+    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [activeVideoFrame]);
+
   const restoreVideoFrame = (frame: VideoFrameSummary, record?: InspectionRecord) => {
+    // When a video is currently loaded, just seek to the timestamp — keep the player alive
+    if (!record && sourceType === "video" && videoObjectUrl && videoRef.current) {
+      videoRef.current.currentTime = frame.frameTimeSec;
+      setLatest((prev) => ({
+        ...prev,
+        source: { ...prev.source, selectedFrameTimeSec: frame.frameTimeSec },
+      }));
+      setMonitorPanel("frames");
+      return;
+    }
     stopScanning();
     if (cameraActive) {
       stopCamera();
@@ -1376,7 +1550,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
     setSelectedDetectionId(restored.detections[0]?.id ?? "");
     setSourceType("image");
     setVideoObjectUrl((current) => {
-      if (current) URL.revokeObjectURL(current);
+      if (current && current.startsWith("blob:")) URL.revokeObjectURL(current);
       return "";
     });
     setImagePreview(restored.evidenceImage ?? restored.annotatedImage ?? record?.preview ?? "");
@@ -1409,15 +1583,27 @@ export function ControlRoom({ page }: { page: AppPage }) {
     const restored = recordToInferenceResult(record);
     setLatest(restored);
     setSelectedDetectionId(restored.detections[0]?.id ?? "");
-    setSourceType("image");
-    setVideoObjectUrl((current) => {
-      if (current) URL.revokeObjectURL(current);
-      return "";
-    });
-    const preview = restored.evidenceImage ?? restored.annotatedImage ?? record.preview ?? "";
+
     const targetPanel: MonitorPanel =
       record.source === "video" && record.frames?.length ? "frames" : restored.detections.length ? "selected" : "findings";
     const message = `Focused ${record.source} inspection loaded from history.`;
+
+    // Try to reload the video when we have a stable (non-blob, non-YouTube) URL
+    const playableUrl =
+      record.source === "video" &&
+      record.sourceUrl &&
+      !record.sourceUrl.startsWith("blob:") &&
+      !record.sourceUrl.includes("youtube.com") &&
+      !record.sourceUrl.includes("youtu.be")
+        ? record.sourceUrl
+        : null;
+
+    setVideoObjectUrl((current) => {
+      if (current && current.startsWith("blob:")) URL.revokeObjectURL(current);
+      return playableUrl ?? "";
+    });
+    setSourceType(playableUrl ? "video" : "image");
+    const preview = playableUrl ? "" : (restored.evidenceImage ?? restored.annotatedImage ?? record.preview ?? "");
     setImagePreview(preview);
     setApiMessage(message);
     setMonitorPanel(targetPanel);
@@ -1448,27 +1634,27 @@ export function ControlRoom({ page }: { page: AppPage }) {
     }
     const payload = normalizeResult(job.result);
     stopScanning();
-    if (cameraActive) {
-      stopCamera();
-    }
+    if (cameraActive) stopCamera();
     setWorkspaceView("monitor");
     setLatest(payload);
     setSelectedDetectionId(payload.detections[0]?.id ?? "");
-    setSourceType("image");
-    setVideoObjectUrl((current) => {
-      if (current) URL.revokeObjectURL(current);
-      return "";
-    });
-    setImagePreview(payload.evidenceImage ?? payload.annotatedImage ?? "");
     setMonitorPanel("frames");
+    if (videoObjectUrl) {
+      // Video still loaded — keep player alive so per-frame overlays work while seeking
+      setSourceType("video");
+      setImagePreview("");
+    } else {
+      setSourceType("image");
+      setImagePreview(payload.evidenceImage ?? payload.annotatedImage ?? "");
+    }
     recordResult(payload, "video", payload.evidenceImage ?? payload.annotatedImage, {
       sourceUrl: job.mediaUrl,
       sessionId: job.id,
     });
     setApiMessage(
-      `Loaded video task result: ${payload.detections.length} finding${payload.detections.length === 1 ? "" : "s"} across ${
+      `Video scan complete: ${payload.detections.length} finding${payload.detections.length === 1 ? "" : "s"} across ${
         payload.source?.positiveFrameCount ?? 0
-      } defect-positive frame${(payload.source?.positiveFrameCount ?? 0) === 1 ? "" : "s"}.`,
+      } positive frame${(payload.source?.positiveFrameCount ?? 0) === 1 ? "" : "s"}. Seek the player to see frame overlays.`,
     );
   };
 
@@ -1499,8 +1685,7 @@ export function ControlRoom({ page }: { page: AppPage }) {
         setVideoJob(job);
         if (job.status === "completed" && !completedVideoJobIdsRef.current.has(job.id)) {
           completedVideoJobIdsRef.current.add(job.id);
-          setApiMessage("Video analysis task completed. Load the result when you are ready.");
-          setMonitorPanel("frames");
+          loadVideoJobResultRef.current?.(job);
         } else if (job.status === "failed") {
           setApiMessage((job.error || job.message || "Video analysis task failed.").slice(0, 180));
         } else if (job.status === "cancelled") {
@@ -1761,15 +1946,24 @@ export function ControlRoom({ page }: { page: AppPage }) {
                     step={0.05}
                     onChange={(value) => setSettings((current) => ({ ...current, iou: value }))}
                   />
-                  <Slider
-                    label="Frame interval"
-                    suffix="ms"
-                    value={settings.frameIntervalMs}
-                    min={300}
-                    max={2200}
-                    step={100}
-                    onChange={(value) => setSettings((current) => ({ ...current, frameIntervalMs: value }))}
-                  />
+                  <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-white/10 bg-white/[0.03] p-3 hover:bg-white/[0.06]">
+                    <div className="relative mt-0.5 shrink-0">
+                      <input
+                        type="checkbox"
+                        className="sr-only"
+                        checked={settings.agnosticNms}
+                        onChange={(e) => setSettings((current) => ({ ...current, agnosticNms: e.target.checked }))}
+                      />
+                      <div className={`h-5 w-9 rounded-full transition-colors ${settings.agnosticNms ? "bg-teal-400" : "bg-white/20"}`} />
+                      <div className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${settings.agnosticNms ? "translate-x-4" : "translate-x-0.5"}`} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-slate-100">Cross-class NMS</p>
+                      <p className="mt-0.5 text-xs leading-5 text-slate-400">
+                        Suppresses overlapping boxes across different defect types. Reduces duplicate detections on elongated defects like cracks, but may remove genuine co-located defects.
+                      </p>
+                    </div>
+                  </label>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3 border-t border-white/10 p-4">
@@ -2194,16 +2388,19 @@ export function ControlRoom({ page }: { page: AppPage }) {
                   <div className="flex flex-wrap gap-2">
                     <button
                       onClick={toggleLiveMonitoring}
-                      className="theme-live-button inline-flex h-10 items-center gap-2 rounded-lg border border-teal-300/30 bg-teal-300/10 px-3 text-sm font-semibold text-teal-100 hover:bg-teal-300/15"
+                      disabled={backendWaking}
+                      className="theme-live-button inline-flex h-10 items-center gap-2 rounded-lg border border-teal-300/30 bg-teal-300/10 px-3 text-sm font-semibold text-teal-100 hover:bg-teal-300/15 disabled:cursor-wait disabled:opacity-60"
                     >
                       {scanning || (sourceType !== "video" && cameraActive) ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                      {sourceType === "video"
-                        ? scanning
-                          ? "Pause video scan"
-                          : "Scan video"
-                        : scanning || cameraActive
-                          ? "Stop live monitor"
-                          : "Live monitor"}
+                      {backendWaking
+                        ? "Starting backend..."
+                        : sourceType === "video"
+                          ? scanning
+                            ? "Pause video scan"
+                            : "Scan video"
+                          : scanning || cameraActive
+                            ? "Stop live monitor"
+                            : "Live monitor"}
                     </button>
                     <button
                       onClick={runCurrentFrameOnce}
@@ -2238,30 +2435,48 @@ export function ControlRoom({ page }: { page: AppPage }) {
                 </div>
                 {SAMPLE_IMAGES.length > 0 ? (
                   <div className="border-b border-white/10 bg-[#0b1016] px-4 py-3">
-                    <p className="mb-2 text-xs font-semibold uppercase tracking-[0.13em] text-slate-500">Try a sample image</p>
+                    <p className="mb-2 text-xs font-semibold uppercase tracking-[0.13em] text-slate-500">Try a sample</p>
                     <div className="flex flex-wrap gap-2">
-                      {SAMPLE_IMAGES.map((sample) => (
+                      {SAMPLE_IMAGES.filter((s) => s.filename !== "demo_video.mp4").map((sample) => (
                         <button
                           key={sample.filename}
                           type="button"
                           className="group flex flex-col items-start rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-left transition hover:border-teal-300/30 hover:bg-teal-300/[0.05] active:scale-[0.97]"
                           onClick={async () => {
-                            try {
-                              const res = await fetch(`/samples/${sample.filename}`);
-                              if (!res.ok) return;
-                              const blob = await res.blob();
-                              const file = new File([blob], sample.filename, { type: blob.type || "image/jpeg" });
-                              onUploadMedia(file);
-                            } catch {
-                              // silently ignore network errors
+                            if (sample.type === "video") {
+                              void triggerSampleVideoJob(sample.filename, sample.label);
+                            } else {
+                              try {
+                                const res = await fetch(`/samples/${sample.filename}`);
+                                if (!res.ok) return;
+                                const blob = await res.blob();
+                                const file = new File([blob], sample.filename, { type: blob.type || "image/jpeg" });
+                                void onUploadMedia(file);
+                              } catch {
+                                // silently ignore network errors
+                              }
                             }
                           }}
                         >
-                          <span className="text-xs font-semibold text-slate-200 group-hover:text-teal-100">{sample.label}</span>
+                          <span className="text-xs font-semibold text-slate-200 group-hover:text-teal-100">
+                            {sample.type === "video" && <span className="mr-1.5 rounded bg-violet-500/30 px-1 py-0.5 text-[9px] font-bold uppercase tracking-wide text-violet-300">vid</span>}
+                            {sample.label}
+                          </span>
                           <span className="mt-0.5 text-[10px] text-slate-500 group-hover:text-teal-300/70">{sample.defectHint}</span>
                         </button>
                       ))}
                     </div>
+                    {SAMPLE_IMAGES.find((s) => s.filename === "demo_video.mp4") && (
+                      <button
+                        type="button"
+                        className="group mt-2 flex w-full items-center gap-3 rounded-lg border border-amber-300/25 bg-amber-300/[0.06] px-3 py-2 text-left transition hover:border-amber-300/50 hover:bg-amber-300/[0.12] active:scale-[0.99]"
+                        onClick={() => void triggerSampleVideoJob("demo_video.mp4", "All defects")}
+                      >
+                        <span className="rounded bg-amber-400/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-300">demo</span>
+                        <span className="text-xs font-semibold text-amber-100 group-hover:text-amber-50">All defects — full pipeline demo</span>
+                        <span className="ml-auto text-[10px] text-slate-500 group-hover:text-amber-300/70">all 5 defect classes</span>
+                      </button>
+                    )}
                   </div>
                 ) : null}
                 {showLinkInput ? (
@@ -2272,8 +2487,11 @@ export function ControlRoom({ page }: { page: AppPage }) {
                       onChange={(event) => setMediaUrl(event.target.value)}
                       placeholder="Public Drive file URL, image/video URL, or YouTube link"
                     />
-                    <label className="grid grid-cols-[1fr_64px] items-center gap-2 text-xs uppercase tracking-[0.16em] text-slate-500">
-                      Start
+                    <label
+                      className="grid grid-cols-[1fr_64px] items-center gap-2 text-xs uppercase tracking-[0.16em] text-slate-500"
+                      title="Skip to this time (in seconds) before scanning begins. Leave at 0 to scan from the start."
+                    >
+                      Start (s)
                       <input
                         className="h-10 rounded-lg border border-white/10 bg-[#111820] px-2 text-sm text-slate-100 outline-none focus:border-violet-300/60"
                         type="number"
@@ -2354,6 +2572,9 @@ export function ControlRoom({ page }: { page: AppPage }) {
                             videoRef.current.currentTime = Math.max(0, linkFrameTime);
                           }
                         }}
+                        onTimeUpdate={() => {
+                          if (videoRef.current) setVideoCurrentTime(videoRef.current.currentTime);
+                        }}
                       />
                     ) : evidenceImage ? (
                       // eslint-disable-next-line @next/next/no-img-element
@@ -2374,28 +2595,44 @@ export function ControlRoom({ page }: { page: AppPage }) {
                       </div>
                     )}
 
-                    {showInteractiveDetections ? latest.detections.map((detection) => (
-                      <button
-                        key={detection.id}
-                        className={`absolute border-2 text-left shadow-[0_0_24px_rgba(0,0,0,0.55)] transition ${
-                          detection.id === selectedDetection?.id ? "border-white" : "border-cyan-300"
-                        }`}
-                        style={{
-                          left: pct(detection.bbox.x),
-                          top: pct(detection.bbox.y),
-                          width: pct(detection.bbox.width),
-                          height: pct(detection.bbox.height),
-                        }}
-                        onClick={() => selectDetection(detection.id)}
-                      >
-                        <span
-                          className="absolute -top-7 left-0 rounded-md px-2 py-1 text-xs font-semibold text-slate-950"
-                          style={{ background: severityColors[detection.severity] }}
+                    {showInteractiveDetections ? (activeVideoFrame?.detectionItems ?? (sourceType === "video" && videoObjectUrl ? [] : latest.detections)).map((detection) => {
+                      const isSelected = detection.id === selectedDetection?.id;
+                      const col = severityColors[detection.severity];
+                      return (
+                        <button
+                          key={detection.id}
+                          className="absolute cursor-pointer text-left transition-all duration-100 focus:outline-none"
+                          style={{
+                            left: pct(detection.bbox.x),
+                            top: pct(detection.bbox.y),
+                            width: pct(detection.bbox.width),
+                            height: pct(detection.bbox.height),
+                            border: `2px solid ${col}`,
+                            background: isSelected ? `${col}22` : "transparent",
+                            boxShadow: isSelected ? `0 0 0 1px ${col}55, inset 0 0 20px ${col}0d` : "none",
+                          }}
+                          onMouseEnter={(e) => {
+                            if (!isSelected) (e.currentTarget as HTMLElement).style.background = `${col}18`;
+                          }}
+                          onMouseLeave={(e) => {
+                            if (!isSelected) (e.currentTarget as HTMLElement).style.background = "transparent";
+                          }}
+                          onClick={() => selectDetection(detection.id)}
                         >
-                          {detection.className} | {detection.severity}
-                        </span>
-                      </button>
-                    )) : null}
+                          {/* Label chip — always inside top-left so it's never clipped by the image edge */}
+                          <span
+                            className="absolute left-0 top-0 flex max-w-full items-center gap-1 rounded-br px-1.5 py-0.5 text-[10px] font-bold leading-tight text-slate-950"
+                            style={{ background: col }}
+                          >
+                            <span className="truncate">{detection.className}</span>
+                            <span className="shrink-0 opacity-75">
+                              {detection.severity === "uncertain" ? "?" : detection.severity.slice(0, 3).toUpperCase()}
+                            </span>
+                            <span className="shrink-0 font-normal opacity-70">{Math.round(detection.confidence * 100)}%</span>
+                          </span>
+                        </button>
+                      );
+                    }) : null}
                   </div>
 
                   {showVideo || evidenceImage || latest.detections.length ? (
@@ -2521,21 +2758,29 @@ export function ControlRoom({ page }: { page: AppPage }) {
                           </p>
                         </div>
                         {latestDefectFrames.length ? (
-                          latestDefectFrames.slice(0, 24).map((frame) => {
-                            const selectedFrame =
+                          <div ref={framesListRef} className="space-y-1">
+                          {latestDefectFrames.slice(0, 24).map((frame) => {
+                            const isLive = activeVideoFrame?.id === frame.id;
+                            const isSelected = !isLive &&
                               latest.source?.selectedFrameTimeSec !== undefined &&
                               Math.abs(frame.frameTimeSec - latest.source.selectedFrameTimeSec) < 0.2;
                             return (
                               <button
                                 key={frame.id}
+                                data-frame-id={frame.id}
                                 onClick={() => restoreVideoFrame(frame)}
                                 className={`grid w-full grid-cols-[72px_1fr_auto] items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs transition ${
-                                  selectedFrame
-                                    ? "border-violet-300/50 bg-violet-300/[0.12]"
-                                    : "border-white/10 bg-white/[0.03] hover:bg-white/[0.07]"
+                                  isLive
+                                    ? "border-cyan-300/60 bg-cyan-300/[0.14] ring-1 ring-cyan-300/30"
+                                    : isSelected
+                                      ? "border-violet-300/50 bg-violet-300/[0.12]"
+                                      : "border-white/10 bg-white/[0.03] hover:bg-white/[0.07]"
                                 }`}
                               >
-                                <span className="font-mono font-semibold text-violet-100">{frame.frameTimeSec.toFixed(1)}s</span>
+                                <span className={`font-mono font-semibold ${isLive ? "text-cyan-200" : "text-violet-100"}`}>
+                                  {frame.frameTimeSec.toFixed(1)}s
+                                  {isLive ? <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-cyan-400 align-middle" /> : null}
+                                </span>
                                 <span className="min-w-0">
                                   <span className="block truncate text-slate-200">{frame.classes.join(", ")}</span>
                                   <span className="text-slate-500">
@@ -2545,7 +2790,8 @@ export function ControlRoom({ page }: { page: AppPage }) {
                                 <span className="text-slate-300">{Math.round(frame.maxConfidence * 100)}%</span>
                               </button>
                             );
-                          })
+                          })}
+                          </div>
                         ) : (
                           <p className="rounded-lg border border-white/10 bg-white/[0.03] p-3 text-sm leading-6 text-slate-400">
                             This scan did not return defect-positive frames at the current confidence. Lower confidence or inspect a
@@ -2587,12 +2833,17 @@ export function ControlRoom({ page }: { page: AppPage }) {
                                   {actionMeta.label}
                                 </span>
                               </div>
-                              <div className="mt-3 flex items-center gap-2">
+                              <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1">
                                 <span
-                                  className="h-2.5 w-2.5 rounded-full"
+                                  className="h-2.5 w-2.5 shrink-0 rounded-full"
                                   style={{ backgroundColor: severityColors[detection.severity] }}
                                 />
                                 <span className="text-xs capitalize text-slate-300">{detection.severity}</span>
+                                {detection.severity === "uncertain" && (
+                                  <span className="rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+                                    low confidence — manual check advised
+                                  </span>
+                                )}
                                 <span className="text-xs text-slate-500">area {Math.round(detection.areaRatio * 1000) / 10}%</span>
                               </div>
                               <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-400">{actionMeta.description}</p>
@@ -3414,6 +3665,7 @@ function HistoryVisualGallery({
           {galleryItems.map(({ record, defectFrames, firstFrame, preview }) => {
             const primaryClasses = Array.from(new Set(detectionsForRecord(record).map((item) => item.className))).slice(0, 3);
             const openFrame = firstFrame && record.source === "video";
+            const replayable = record.source === "video" && isReplayableUrl(record.sourceUrl);
             return (
               <button
                 key={record.id}
@@ -3434,6 +3686,11 @@ function HistoryVisualGallery({
                   <span className={`absolute left-2 top-2 rounded-md border bg-black/55 px-2 py-1 text-xs font-semibold ${scoreTone(record.conditionIndex)}`}>
                     CI {record.conditionIndex.toFixed(0)}
                   </span>
+                  {replayable && (
+                    <span className="absolute left-2 bottom-2 rounded-md border border-violet-300/40 bg-black/70 px-2 py-1 text-[11px] font-semibold text-violet-200">
+                      ▶ Video
+                    </span>
+                  )}
                   <span className="absolute bottom-2 right-2 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-xs text-slate-200">
                     {record.source === "video" ? `${defectFrames.length} defect frames` : `${record.detections.length} boxes`}
                   </span>
@@ -3494,7 +3751,7 @@ function HistoryPanel({
         <div>
           <h2 className="text-sm font-semibold text-white">Inspection Records</h2>
           <p className="mt-1 text-xs text-slate-400">
-            Click Open result to focus one saved inspection. Expand video records to choose a defect frame.
+            Click Open result to focus one saved inspection. <span className="text-violet-300">▶ Video replayable</span> means the original video can be played back with bounding boxes. <span className="text-slate-500">Frames only</span> means only static frame images are available (uploaded files or YouTube links).
           </p>
         </div>
         <History className="h-4 w-4 text-slate-400" />
@@ -3506,6 +3763,7 @@ function HistoryPanel({
               const defectFrames = record.frames?.filter((frame) => frame.detections > 0) ?? [];
               const expanded = expandedHistoryId === record.id;
               const recordDetections = detectionsForRecord(record);
+              const replayable = record.source === "video" && isReplayableUrl(record.sourceUrl);
               return (
                 <div key={record.id} className="rounded-lg border border-white/10 bg-white/[0.03]">
                   <div className="grid grid-cols-[1fr_auto_auto] gap-2 p-3">
@@ -3517,9 +3775,21 @@ function HistoryPanel({
                           ? ` | ${record.scannedFrames ?? record.stageMetrics.sampledFrames ?? 1} scanned, ${defectFrames.length} defect frames`
                           : ` | ${record.detections.length} defects`}
                       </span>
-                      <span className="mt-2 inline-flex rounded-md border border-cyan-300/25 bg-cyan-300/10 px-2 py-1 text-[11px] font-semibold text-cyan-100">
-                        Open result for focused review
-                      </span>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        <span className="inline-flex rounded-md border border-cyan-300/25 bg-cyan-300/10 px-2 py-1 text-[11px] font-semibold text-cyan-100">
+                          Open result for focused review
+                        </span>
+                        {replayable && (
+                          <span className="inline-flex items-center gap-1 rounded-md border border-violet-300/30 bg-violet-300/[0.08] px-2 py-1 text-[11px] font-semibold text-violet-200">
+                            ▶ Video replayable
+                          </span>
+                        )}
+                        {record.source === "video" && !replayable && (
+                          <span className="inline-flex rounded-md border border-white/10 bg-white/[0.04] px-2 py-1 text-[11px] text-slate-400">
+                            Frames only
+                          </span>
+                        )}
+                      </div>
                     </button>
                     {record.source === "video" ? (
                       <button

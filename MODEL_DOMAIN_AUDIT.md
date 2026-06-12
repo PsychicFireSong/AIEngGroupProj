@@ -136,13 +136,13 @@ The cascade decomposes the 3-class problem into two sequential binary classifier
 2. **Manual relabeling**: Assign severity by visual inspection of each crop (e.g., depth of crack, extent of spalling, area of corrosion) instead of defect-type proxy.
 3. **Per-defect models**: Train one severity classifier per defect type (already supported by `severity_{class}_cls.pt` naming in inference_api.py).
 
-**Active experiment:**
+**Completed experiments:**
 
-| Experiment | Script | Status | Target |
+| Experiment | Script | Status | Result |
 |---|---|---|---|
 | ~~Stage 1 gradual unfreeze + AdamW (4-phase)~~ | ~~`train_stage1_v2.py`~~ | Killed (user directive) | — |
-| Cascade binary severity (no CODEBRIM) | `train_severity_cascade.py` | **Done** — 66.9% test (thr=0.40) | >65.8% |
-| **CODEBRIM-augmented cascade** | `train_severity_cascade.py` | **Done** — see below | >66.9% |
+| Cascade binary severity (no CODEBRIM) | `train_severity_cascade.py` | **Done** | 66.9% test (thr=0.40) |
+| CODEBRIM-augmented cascade | `train_severity_cascade.py` | **Done** — see below | 63.1% patches / 88.7% facades |
 
 ---
 
@@ -217,7 +217,7 @@ Download + integrate: `python scripts/integrate_extra_data.py --task detector --
 **Next steps to exceed 65.8% severity / 0.694 mAP50:**
 1. ~~**Frozen backbone severity**: `train_severity_frozen.py`~~ — Done: 64.7% (Phase 1), Phase 2 degraded. No improvement.
 2. ~~**Binary cascade**: `train_severity_cascade.py`~~ — Done: 64.4% test. Cascade routing errors offset binary gains.
-3. **CODEBRIM-augmented cascade**: Add CODEBRIM ExposedRebars→critical, Crack/Spalling/Corrosion→moderate, Efflorescence→minor to severity_dataset. Re-run cascade. Expected: critical class accuracy improves from 60.8% to >75%.
+3. ~~**CODEBRIM-augmented cascade**: Add CODEBRIM ExposedRebars→critical, Crack/Spalling/Corrosion→moderate, Efflorescence→minor to severity_dataset.~~ — Done: 63.1% on patches (thr=0.30), 88.7% on CODEBRIM facades (thr=0.70). Domain gap confirmed.
 4. **Add corrosion data**: Download Roboflow corrosion-bi3q3 (CC BY 4.0), run `integrate_extra_data.py` (Stage 1 only)
 5. **Proper severity relabeling**: Visual inspection of each crop — highest impact path to >90%, requires manual effort (~2-4 hours)
 6. **SAHI inference**: No retraining — wraps existing YOLO model with tiled inference for small objects (Stage 1)

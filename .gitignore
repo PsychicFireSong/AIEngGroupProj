@@ -102,6 +102,19 @@ scripts/_remove_spacers.py
 scripts/epoch_watcher_v3.py
 scripts/monitor_v6.py
 scripts/run_chain_v3_v4.py
+scripts/diag_paint.py
+scripts/find_best_samples.py
+scripts/find_public_samples.py
+scripts/test_paint_only.py
+scripts/test_video_job.py
+scripts/ui_test_video_job.mjs
+scripts/verify_public_samples.py
+scripts/video_frames/
+
+# ── UI test artifacts ─────────────────────────────────────────────────────────
+apps/facility-dashboard/scripts/
+apps/facility-dashboard/ui_test_shots/
+apps/facility-dashboard/ui_test_video_job.mjs
 
 # ── Large base model weights (download separately from ultralytics/huggingface) ─
 rtdetr-l.pt

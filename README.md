@@ -15,7 +15,7 @@ Classifies each detected crop: `minor` · `moderate` · `critical`
 Binary cascade: Model 1 (is_critical) → Model 2 (minor_or_moderate)
 
 **Dashboard** (Next.js + FastAPI)  
-Image upload, live camera, video analysis, analytics, inspection history.
+Image upload, live camera, video analysis, analytics, inspection history. Video results include a media player with frame-level bounding box overlay and per-frame seek. Stable-URL video records are replayable from history.
 
 ---
 
@@ -72,9 +72,9 @@ Image / Video Input
 ```
 apps/
   facility-dashboard/          Next.js 16 dashboard (Vercel-deployable)
-    public/samples/            6 pre-loaded demo images
+    public/samples/            5 sample images + 6 demo videos (one per-class source video + all-defects demo)
     src/components/            UI components + charts
-    src/lib/sampleImages.ts    Sample image config
+    src/lib/sampleImages.ts    Sample media config (images and videos)
 
 inference/
   api.py                       FastAPI inference backend (main entry point)
@@ -222,11 +222,15 @@ modal deploy inference/modal_deploy.py
 ## Inference API Endpoints
 
 ```
-POST /predict          image file upload
-POST /predict/url      public image or YouTube URL
-POST /predict/video    async video job
-GET  /jobs/{job_id}    poll video job status
-GET  /health           backend health check
+GET  /health                   backend health check
+GET  /api/models               list available .pt weight files
+POST /api/infer/image          single image upload → detections + annotated image
+POST /api/infer/url            YouTube / Google Drive / direct image or video URL
+POST /api/jobs/video/upload     queue async video job from file upload → returns job_id
+POST /api/jobs/video/local-sample  queue async job for a bundled sample video (server-side read)
+GET  /api/jobs                 list all jobs
+GET  /api/jobs/{job_id}        poll job status (progress %, detected frames)
+DELETE /api/jobs/{job_id}      cancel a running job
 ```
 
 **Key options:**
