@@ -7,7 +7,7 @@ Next.js operations dashboard for the two-stage YOLO defect detection pipeline.
 Start the FastAPI inference backend from the repository root:
 
 ```powershell
-python -m uvicorn apps.inference_api:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn inference.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Start the dashboard:

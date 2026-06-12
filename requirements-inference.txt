@@ -1,0 +1,7 @@
+# Inference API only — lighter than requirements.txt (no training or UI deps)
+ultralytics>=8.2.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+yt-dlp>=2024.4.9
+opencv-python-headless>=4.9.0

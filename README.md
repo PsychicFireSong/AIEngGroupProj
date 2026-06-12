@@ -6,38 +6,35 @@ Two-stage AI pipeline for automated infrastructure defect detection and severity
 
 ## What the System Does
 
-**Stage 1 — Defect Detector** (YOLO11m, 20M params)
-Detects five defect types in facility images and video:
+**Stage 1 — Defect Detector** (YOLO11m, 20M params)  
+Detects five defect types in facility images and video:  
 `crack` · `spalling` · `corrosion` · `pothole` · `paint_degradation`
 
-**Stage 2 — Severity Classifier** (lightweight CNN, 3.2 MB)
-Classifies each detected crop: `minor` · `moderate` · `critical`
+**Stage 2 — Severity Cascade** (two binary classifiers, 3 MB each)  
+Classifies each detected crop: `minor` · `moderate` · `critical`  
+Binary cascade: Model 1 (is_critical) → Model 2 (minor_or_moderate)
 
-**Dashboard** (Next.js + FastAPI)
+**Dashboard** (Next.js + FastAPI)  
 Image upload, live camera, video analysis, analytics, inspection history.
 
 ---
 
 ## Current Model Performance
 
-| Metric | Value | Notes |
+| Metric | Value |
+|---|---|
+| Stage 1 mAP50 (production) | **0.694** |
+| Stage 2 cascade accuracy | **66.9%** |
+
+**Per-class detection (production sweep):**
+
+| Class | Detection Rate | Avg Confidence |
 |---|---|---|
-| Stage 1 mAP50 (baseline) | **0.694** | `defect_detector_hn_weak_candidate.pt` |
-| Stage 1 mAP50 (Phase 1 staged) | **0.682** | Head-only warmup complete |
-| Stage 1 mAP50 (Phase 2 NWD) | **in progress** | Full unfreeze + NWD loss, ~6h remaining |
-| Stage 1 mAP50 target | **> 0.80** | NWD staged training |
-| Stage 2 accuracy (current) | **65.8%** | Severity classifier |
-| Stage 2 accuracy target | **> 90%** | Per-defect specialist models |
-
-**Per-class detection (production sweep, baseline):**
-
-| Class | Detection Rate | Avg Confidence | Notes |
-|---|---|---|---|
-| crack | 66.7% | 0.706 | External dataset: 75.0% |
-| spalling | 69.2% | 0.834 | Strong |
-| corrosion | 25.0% | 0.727 | Domain shift — industrial metal vs building facade |
-| pothole | 100.0% | 0.749 | Excellent |
-| paint_degradation | 80.0% | 0.645 | External: 100% |
+| crack | 66.7% | 0.706 |
+| spalling | 69.2% | 0.834 |
+| corrosion | 25.0% | 0.727 |
+| pothole | 100.0% | 0.749 |
+| paint_degradation | 80.0% | 0.645 |
 
 ---
 
@@ -47,18 +44,18 @@ Image upload, live camera, video analysis, analytics, inspection history.
 Image / Video Input
         │
         ▼
-┌───────────────────┐       ┌───────────────────────┐
-│  Stage 1          │       │  Stage 2               │
-│  YOLO11m Detector │──────▶│  Severity Classifier   │
-│  5 classes, 640px │       │  minor/moderate/critical│
-└───────────────────┘       └───────────────────────┘
+┌───────────────────┐       ┌──────────────────────────┐
+│  Stage 1          │       │  Stage 2 Severity Cascade │
+│  YOLO11m Detector │──────▶│  Model 1: is_critical?    │
+│  5 classes, 640px │       │  Model 2: minor/moderate? │
+└───────────────────┘       └──────────────────────────┘
         │                               │
         └───────────────┬───────────────┘
                         ▼
               ┌──────────────────┐
               │  FastAPI Backend  │
-              │  inference_api.py │
-              │  Port 8000, GPU   │
+              │  inference/api.py │
+              │  Port 8000        │
               └────────┬─────────┘
                        │
               ┌────────▼─────────┐
@@ -70,73 +67,57 @@ Image / Video Input
 
 ---
 
+## Repository Layout
+
+```
+apps/
+  facility-dashboard/          Next.js 16 dashboard (Vercel-deployable)
+    public/samples/            6 pre-loaded demo images
+    src/components/            UI components + charts
+    src/lib/sampleImages.ts    Sample image config
+
+inference/
+  api.py                       FastAPI inference backend (main entry point)
+  api_tta_wbf.py               TTA + WBF ensemble variant
+  app.py                       Legacy Streamlit demo
+  Dockerfile                   Container for Hugging Face Spaces deployment
+
+notebooks/
+  training_pipeline_colab.ipynb   Baseline Colab training notebook
+  revised_training_colab.ipynb    Revised training with cascaded severity
+  v7_training.ipynb               v7_lean staged fine-tuning
+
+scripts/                       Training, eval, and dataset scripts (see scripts/README.md)
+  train_staged.py              Stage 1 recommended training entry point
+  train_severity_cascade.py    Stage 2 binary cascade training
+  build_v7_lean.py             Dataset assembly
+  eval_cascade_threshold.py    Threshold sweep
+  ...
+
+weights/                       Production model weights (Git LFS)
+  defect_detector.pt           Stage 1 YOLO11m (153 MB)
+  severity_cls.pt              Stage 2 single-model baseline (3 MB)
+  severity_critical_cls.pt     Stage 2 cascade — is_critical (3 MB)
+  severity_minor_moderate_cls.pt  Stage 2 cascade — minor_or_moderate (3 MB)
+
+configs/
+  merge_config.yaml            90+ label synonyms → 5 classes
+requirements.txt               Full deps (training + inference + UI)
+requirements-inference.txt     Inference-only deps (for Docker deployment)
+```
+
+---
+
 ## Dataset
 
-**v7_lean_dataset** — final production training set.
+**v7_lean_dataset** — production training set, 7 sources merged via `configs/merge_config.yaml`.
 
 | Split | Images |
 |---|---|
 | Train | 20,166 |
 | Val | 3,855 |
 
-**7 source datasets → 5 classes** (90+ label synonyms mapped via `configs/merge_config.yaml`):
-
-| Source | Images | Mapped Classes | Domain |
-|---|---|---|---|
-| Finale.yolov11 (Roboflow) | 11,046 | crack, spalling, paint_degradation | Concrete facades |
-| Concrete Defect Detection | 6,806 | crack, spalling, corrosion, paint_degradation | Clean concrete |
-| Internal Wall Defect | 4,417 | paint_degradation | Interior walls |
-| Metal Corrosion | 5,697 | crack, corrosion, paint_degradation | Industrial metal |
-| Corrosion YOLOv8 | 1,644 | corrosion | Metal rust |
-| Pothole Detection YOLOv8 | 608 | pothole | Road surfaces |
-| Kaggle Pothole Archive | 3,940 | pothole | Road surfaces |
-| **Total** | **34,158** | | |
-
----
-
-## Training History
-
-| Run | mAP50 | Result |
-|---|---|---|
-| Baseline (merged 34K) | 0.851 | Initial. Domain shift found on external eval. |
-| Hard negative + weak class fine-tune | **0.694** | Current best. `defect_detector_hn_weak_candidate.pt` |
-| v7_fixed oversampled ❌ | 0.612 | Catastrophic forgetting. Killed. |
-| Staged Phase 1 (freeze=20, head-only) | 0.682 | Complete. Head calibrated on clean data. |
-| Staged Phase 2 (NWD, full unfreeze) | **TBD** | Running. Expected +2-4 mAP pts from NWD loss. |
-
-**Key training constraints (Windows / RTX 3070 Ti 8 GB):**
-- `workers=0` — required, avoids DataLoader deadlock on Windows
-- `copy_paste=0.0` — required with workers=0; copy_paste=0.3 causes ~50 s/batch
-- Phase 2 `batch=8` — full unfreeze at batch=16 risks OOM (7.77 GB / 8.19 GB)
-
----
-
-## Repository Layout
-
-```
-apps/
-  facility-dashboard/        Next.js 16 dashboard frontend
-  inference_api.py           FastAPI GPU inference backend
-  inference_app.py           Legacy Streamlit demo
-
-configs/
-  merge_config.yaml          Dataset merge class mapping (90+ synonyms → 5 classes)
-  production_eval_manifest.csv
-
-scripts/
-  train_staged.py            Two-phase staged fine-tuning (current)
-  train_nwd.py               NWD loss single-phase training
-  merge_datasets.py          Multi-source dataset consolidation
-  extract_severity_crops.py  Crop ROIs for severity classifier
-  build_v7_lean_dataset.py   Build v7_lean training split
-  eval_tta_enhanced.py       TTA evaluation benchmark
-  wider_production_sweep.py  Production-style eval across domains
-  generate_presentation.py   Generate PowerPoint presentation
-  ... (58 scripts total)
-
-two_stage_yolo_defect_pipeline_colab.ipynb        Baseline training notebook
-two_stage_yolo_defect_pipeline_revised_training_colab.ipynb
-```
+Datasets are not stored in this repo (multi-GB). Download from Roboflow/Zenodo or run `scripts/merge_datasets.py` after setting up API keys.
 
 ---
 
@@ -145,17 +126,11 @@ two_stage_yolo_defect_pipeline_revised_training_colab.ipynb
 ```powershell
 git clone https://github.com/PsychicFireSong/AIEngGroupProj.git
 cd AIEngGroupProj
+git lfs pull                             # download model weights
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 cd apps/facility-dashboard && npm install && cd ../..
-```
-
-Place model weights:
-```
-weights/defect_detector.pt      # Stage 1 detector
-weights/severity_cls.pt         # Stage 2 classifier
 ```
 
 ---
@@ -164,8 +139,7 @@ weights/severity_cls.pt         # Stage 2 classifier
 
 **Inference backend:**
 ```powershell
-python -m uvicorn apps.inference_api:app --host 0.0.0.0 --port 8000 --reload
-# Health check: http://localhost:8000/health
+python -m uvicorn inference.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 **Dashboard:**
@@ -183,90 +157,75 @@ npm run dev
 
 ---
 
-## Inference API
-
-`POST /predict` — image file upload  
-`POST /predict/url` — public image URL  
-`POST /predict/video` — async video job  
-`GET /jobs/{job_id}` — poll video job result  
-`GET /health` — backend status
-
-**Key inference options:**
-- Per-class confidence thresholds: 0.25 (crack/spalling/corrosion/pothole), 0.30 (paint_degradation)
-- TTA + WBF via `use_tta=True` — +37 pp corrosion recall, +11 pp crack recall in production
-- Video: configurable FPS, max duration, async job queue
-
-**Environment variables:**
-```
-AIENG_MODEL_ROOTS              extra model search paths (semicolon-separated)
-AIENG_VIDEO_SCAN_FPS           default 1.0
-AIENG_MAX_VIDEO_SCAN_FPS       default 30.0
-AIENG_MAX_VIDEO_SCAN_SECONDS   default 600
-AIENG_VIDEO_JOB_WORKERS        default 1
-AIENG_MAX_VIDEO_JOBS           default 6
-```
-
----
-
-## Google Colab Training
-
-```
-two_stage_yolo_defect_pipeline_colab.ipynb          — baseline setup
-two_stage_yolo_defect_pipeline_revised_training_colab.ipynb  — revised training
-```
-
-Required Colab secrets: `ROBOFLOW_API_KEY`, `KAGGLE_USERNAME`, `KAGGLE_KEY`
-
-Outputs stored at: `/content/drive/MyDrive/AIEngGroupProj_colab_outputs/`
-
----
-
 ## Deployment
 
-**Frontend (Vercel):**
-```
-Root Directory:   apps/facility-dashboard
-Framework:        Next.js
-Build Command:    npm run build
-Env var:          NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host
-```
+### Frontend — Vercel (free)
 
-**Backend:** GPU VM or containerised service (needs CUDA, Ultralytics, OpenCV).
-```powershell
-python -m uvicorn apps.inference_api:app --host 0.0.0.0 --port 8000
-```
+| Setting | Value |
+|---|---|
+| Root Directory | `apps/facility-dashboard` |
+| Framework | Next.js |
+| Build Command | `npm run build` |
+| Environment Variable | `NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host` |
+
+### Backend — Hugging Face Spaces (free)
+
+HF Spaces Docker spaces run on CPU (2 cores, 16 GB RAM). YOLO CPU inference is ~1–3 s/image — fine for a demo.
+
+1. Create a new Space → **Docker** SDK at `https://huggingface.co/spaces`
+2. Push this repo to your Space (or link the GitHub repo):
+   ```bash
+   # From inference/ — HF Spaces looks for Dockerfile here
+   # OR set Space root to repo root and point to inference/Dockerfile
+   ```
+3. Upload weights to HF Hub (avoids LFS limits in Spaces):
+   ```bash
+   pip install huggingface_hub
+   huggingface-cli upload YOUR_USERNAME/aieng-weights weights/
+   ```
+4. Set Space secrets (Settings → Variables and Secrets):
+   ```
+   AIENG_MODEL_ROOTS=/app/weights
+   ```
+
+The `inference/Dockerfile` already uses `requirements-inference.txt` and copies `weights/` into the image.
+
+> **Alternative free options:** Render (free tier, 512 MB RAM — may be tight for YOLO), Koyeb (free tier, 512 MB). HF Spaces is recommended for ML models.
 
 ---
 
-## Validation
+## Inference API Endpoints
 
-```powershell
-# Frontend lint + build
-cd apps/facility-dashboard && npm run lint && npm run build
-
-# Python syntax check
-py -3 -m py_compile apps/inference_api.py scripts/merge_datasets.py
-
-# Production sweep (needs weights)
-python scripts/wider_production_sweep.py --help
-
-# Generate presentation
-python scripts/generate_presentation.py
 ```
+POST /predict          image file upload
+POST /predict/url      public image or YouTube URL
+POST /predict/video    async video job
+GET  /jobs/{job_id}    poll video job status
+GET  /health           backend health check
+```
+
+**Key options:**
+- Per-class confidence thresholds: 0.25 (crack/spalling/corrosion/pothole), 0.30 (paint_degradation)
+- TTA + WBF via `use_tta=True` — +37 pp corrosion recall, +11 pp crack recall
 
 ---
 
-## Security Rules
+## Training
 
-- Do not commit `.pt` files outside `weights/` (tracked by Git LFS).
-- Do not commit API keys (Roboflow, Kaggle).
-- Do not commit `output/`, `runs/`, downloaded datasets, inspection history.
+See [QUICK_START.md](QUICK_START.md) for the full training workflow and [scripts/README.md](scripts/README.md) for a script index.
+
+Colab notebooks in `notebooks/` run the full pipeline on Google Drive with GPU.
+
+**Windows training constraints (RTX 3070 Ti 8 GB):**
+- `workers=0` — required to avoid DataLoader deadlock
+- `copy_paste=0.0` — required with workers=0 (otherwise ~50 s/batch)
+- Phase 2 `batch=8` — full unfreeze at batch=16 risks OOM
 
 ---
 
 ## More
 
 - Dashboard details: [apps/facility-dashboard/README.md](apps/facility-dashboard/README.md)
-- Quick workflow: [QUICK_START.md](QUICK_START.md)
+- Quick training workflow: [QUICK_START.md](QUICK_START.md)
+- Script index: [scripts/README.md](scripts/README.md)
 - Domain analysis: [MODEL_DOMAIN_AUDIT.md](MODEL_DOMAIN_AUDIT.md)
-- Presentation: `AIEngGroupProj_Presentation.pptx` (run `python scripts/generate_presentation.py`)
