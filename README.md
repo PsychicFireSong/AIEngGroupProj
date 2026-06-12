@@ -168,24 +168,72 @@ npm run dev
 | Build Command | `npm run build` |
 | Environment Variable | `NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host` |
 
-### Backend — Hugging Face Spaces (free, CPU)
+### Backend options
 
-HF Spaces Docker spaces give 2 CPU cores and 16 GB RAM — free with no time limits. YOLO CPU inference is ~1–3 s/image, fine for a demo. **HF Spaces hosts the backend only; the Next.js frontend stays on Vercel.**
+The frontend (Vercel) and backend (inference API) are always separate. Pick one backend tier below.
+
+---
+
+#### Option A — Oracle Cloud Always Free ✅ Recommended
+
+**4 ARM Ampere cores · 24 GB RAM · never sleeps · free forever.**  
+Best performance of any free option. Requires ~30 min of one-time VM setup.
+
+1. Sign up at [cloud.oracle.com](https://cloud.oracle.com) → **Create VM** → Shape: `VM.Standard.A1.Flex` → 4 OCPUs, 24 GB RAM
+2. SSH into the VM and install Docker:
+   ```bash
+   sudo apt update && sudo apt install -y docker.io
+   sudo usermod -aG docker $USER && newgrp docker
+   ```
+3. Clone the repo and start the API:
+   ```bash
+   git clone https://github.com/PsychicFireSong/AIEngGroupProj.git
+   cd AIEngGroupProj
+   git lfs pull
+   docker build -t aieng-api .
+   docker run -d -p 8000:8000 --restart=always \
+     -e AIENG_MODEL_ROOTS=/app/weights aieng-api
+   ```
+4. Open port 8000 in the Oracle VCN Security List, then set the Vercel env var:
+   ```
+   NEXT_PUBLIC_INFERENCE_API_URL=http://<your-vm-public-ip>:8000
+   ```
+
+ARM Ampere delivers ~400–600 ms/image — roughly 2–3× faster than generic cloud CPUs.
+
+---
+
+#### Option B — Hugging Face Spaces (free, CPU, may sleep)
+
+2 CPU cores · 16 GB RAM · free · **sleeps after 48 h idle** (30–60 s wake-up).  
+Fine for a planned demo — call `GET /warmup` 30 s before the session starts.
 
 1. Go to [huggingface.co/spaces](https://huggingface.co/spaces) → **Create new Space** → SDK: **Docker**
-2. Connect this GitHub repo (or push manually). HF Spaces picks up the `Dockerfile` at the repo root automatically.
-3. Set Space secrets (Settings → Variables and Secrets):
-   ```
-   AIENG_MODEL_ROOTS=/app/weights
-   ```
-4. Once the Space is running, copy the public URL (e.g. `https://username-spacename.hf.space`) and set it as the Vercel env var:
+2. Connect this GitHub repo. HF Spaces picks up the `Dockerfile` at the repo root.
+3. Set Space secret: `AIENG_MODEL_ROOTS=/app/weights`
+4. Copy the Space URL and set Vercel env var:
    ```
    NEXT_PUBLIC_INFERENCE_API_URL=https://username-spacename.hf.space
    ```
 
-The `Dockerfile` at repo root installs `requirements-inference.txt`, copies `inference/` and `weights/`, and starts uvicorn on port 7860.
+> **Pre-warm before a demo:** `curl https://username-spacename.hf.space/warmup`
 
-> **Alternative free backends:** Render and Koyeb both have free tiers but only 512 MB RAM — tight for YOLO model loading. HF Spaces (16 GB) is the recommended free option for ML workloads.
+---
+
+#### Option C — Railway (~$5/month)
+
+Always-on, persistent, GitHub connect, click-and-deploy. Set root to repo root, start command: `python -m uvicorn inference.api:app --host 0.0.0.0 --port 8000`. No setup friction, small monthly cost.
+
+---
+
+#### Not recommended
+
+| Service | Why not |
+|---|---|
+| Vercel full-stack | 250 MB bundle limit (YOLO alone is 153 MB + deps); 60 s function timeout kills video jobs; no persistent model cache |
+| Render free tier | 512 MB RAM — not enough to load YOLO11m |
+| Koyeb free tier | 512 MB RAM — same issue |
+| Fly.io free tier | 256 MB RAM per machine — same issue |
 
 ---
 

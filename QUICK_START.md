@@ -156,17 +156,25 @@ Build Command:   npm run build
 Env var:         NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host
 ```
 
-### Backend → Hugging Face Spaces (free, CPU-only)
+### Backend options (pick one)
 
-HF Spaces hosts the **backend only** — the Next.js frontend goes to Vercel.
+**Option A — Oracle Cloud Always Free** (recommended)  
+4 ARM cores · 24 GB RAM · never sleeps · ~400–600 ms/image.
+```bash
+# On the Oracle VM (VM.Standard.A1.Flex, 4 OCPU, 24 GB RAM):
+git clone https://github.com/PsychicFireSong/AIEngGroupProj.git && cd AIEngGroupProj
+git lfs pull
+docker build -t aieng-api . && docker run -d -p 8000:8000 --restart=always \
+  -e AIENG_MODEL_ROOTS=/app/weights aieng-api
+```
+Open port 8000 in Oracle VCN Security List. See README for full steps.
 
-1. Create a Space at [huggingface.co/spaces](https://huggingface.co/spaces) → SDK: **Docker**
-2. Connect this GitHub repo. HF Spaces finds the `Dockerfile` at the repo root automatically.
-3. Set Space secret → `AIENG_MODEL_ROOTS=/app/weights`
-4. Copy the Space URL and set it as the Vercel env var:
-   `NEXT_PUBLIC_INFERENCE_API_URL=https://username-spacename.hf.space`
+**Option B — Hugging Face Spaces** (free, sleeps after 48 h idle)  
+1. Create Space → Docker SDK → connect GitHub repo
+2. Set secret: `AIENG_MODEL_ROOTS=/app/weights`
+3. Pre-warm before demos: `curl https://username-spacename.hf.space/warmup`
 
-CPU inference is ~1–3 s/image — fine for a demo. Free with no time limit.
+**Option C — Railway** (~$5/month, always-on, zero setup friction)
 
 ---
 
