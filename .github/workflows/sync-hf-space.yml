@@ -1,0 +1,37 @@
+name: Sync backend to HF Space
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "inference/**"
+      - "Dockerfile"
+      - "requirements-inference.txt"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+
+      - name: Push to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cd /tmp
+          git clone https://FrAnKu34t23:${HF_TOKEN}@huggingface.co/spaces/FrAnKu34t23/aieng-backend hf-space
+          cd hf-space
+
+          # Sync only backend-relevant files
+          cp $GITHUB_WORKSPACE/Dockerfile .
+          cp $GITHUB_WORKSPACE/requirements-inference.txt .
+          cp -r $GITHUB_WORKSPACE/inference .
+
+          git config user.email "102782407@students.swinburne.edu.my"
+          git config user.name "GitHub Actions"
+          git add Dockerfile requirements-inference.txt inference/
+          git diff --staged --quiet || git commit -m "Sync from GitHub ${GITHUB_SHA::8}"
+          git push

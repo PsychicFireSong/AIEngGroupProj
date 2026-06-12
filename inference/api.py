@@ -99,6 +99,14 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc):
+    import traceback
+    from fastapi.responses import JSONResponse
+    tb = traceback.format_exc()
+    return JSONResponse(status_code=500, content={"detail": str(exc), "traceback": tb})
+
+
 @app.on_event("startup")
 def _warmup_models() -> None:
     """Pre-load models at startup so the first real request is fast.
@@ -1300,9 +1308,15 @@ async def infer_image(
     use_tta: bool = Form(False),
     agnostic_nms: bool = Form(False),
 ) -> dict:
-    payload = await file.read()
-    image = _decode_upload(payload)
-    return _run_inference(image, detector_path, severity_path, confidence, iou, use_tta=use_tta, agnostic_nms=agnostic_nms)
+    import traceback
+    from fastapi.responses import JSONResponse
+    try:
+        payload = await file.read()
+        image = _decode_upload(payload)
+        return _run_inference(image, detector_path, severity_path, confidence, iou, use_tta=use_tta, agnostic_nms=agnostic_nms)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        return JSONResponse(status_code=500, content={"detail": str(exc), "traceback": tb})
 
 
 @app.post("/api/infer/url")
