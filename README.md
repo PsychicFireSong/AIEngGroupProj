@@ -168,55 +168,45 @@ npm run dev
 | Build Command | `npm run build` |
 | Environment Variable | `NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host` |
 
-### Backend options
+### Backend deployment
 
-Live camera requires GPU inference (~50 ms/frame). CPU-only services (HF Spaces, Oracle ARM, Render) deliver 800 ms–2 s/frame — live camera will visibly stutter. **If live camera must work, use GPU.**
-
----
-
-#### Option A — Modal.com ✅ Recommended for live camera
-
-**A10G GPU · ~50 ms/image · live camera works · free $10/month credits**  
-$10 credit ≈ 77 GPU-hours (A10G at ~$0.13/hr). Scales to zero between sessions — credits only burn while serving requests.
-
-```bash
-pip install modal
-modal setup                                      # authenticate (one time)
-modal volume create aieng-weights
-modal volume put aieng-weights weights/ /        # upload weights (one time)
-modal deploy inference/modal_deploy.py           # deploy
-```
-
-Copy the public URL from deploy output, set in Vercel:
-```
-NEXT_PUBLIC_INFERENCE_API_URL=https://<your-modal-url>
-```
-
-Pre-warm before each session (avoids 60 s cold start):
-```bash
-curl https://<your-modal-url>/warmup
-```
+**Live camera requires GPU inference (~50 ms/frame). There is no free always-on GPU cloud service — GPU compute costs money everywhere.** For a lab demo, run the backend on the presenting machine; the GPU you already have is the best possible setup.
 
 ---
 
-#### Option B — Local backend (for in-lab demos)
+#### For a lab demo — run locally ✅ Best option
 
-If demoing from your own machine (RTX 3070 Ti), run the backend locally — no latency, full GPU speed, zero cost, live camera works perfectly.
+Your RTX 3070 Ti gives ~50 ms/image — live camera, image upload, and video all work at full speed. No cloud cost, no cold starts, no credit limits.
 
 ```powershell
 python -m uvicorn inference.api:app --host 0.0.0.0 --port 8000 --reload
-# Set NEXT_PUBLIC_INFERENCE_API_URL=http://localhost:8000 in the dashboard
 ```
+Open `http://localhost:3000`. The Vercel env var `NEXT_PUBLIC_INFERENCE_API_URL` defaults to `http://localhost:8000` when not set.
 
 ---
 
-#### Option C — HF Spaces / Oracle ARM (image & video upload only)
+#### For a public URL — choose based on which features you need
 
-CPU-only. Live camera is too slow (~800 ms–2 s/frame). Suitable for image upload and async video jobs only. See setup instructions below the table.
+| Need | Service | Cost | Notes |
+|---|---|---|---|
+| Image + video upload only | **HF Spaces** (Docker) | Free | CPU, ~1–2 s/image, no live camera |
+| Image + video upload only | **Oracle Cloud Always Free** | Free | 4 ARM cores, 24 GB RAM, never sleeps |
+| Live camera + GPU, credits-based | **Modal.com** | Free $10/month then billed | A10G, ~50 ms/image, scales to zero |
+| Live camera + GPU, pay-per-hour | **Vast.ai / RunPod** | ~$0.10–0.20/hr | Rent GPU only when demo is running |
 
-**HF Spaces:** Create Space → Docker SDK → connect repo → set secret `AIENG_MODEL_ROOTS=/app/weights` → copy URL to Vercel env var. Pre-warm: `curl .../warmup`.
+**HF Spaces setup:**
+1. Create Space → Docker SDK → connect this repo → set secret `AIENG_MODEL_ROOTS=/app/weights`
+2. Copy the Space URL → set as `NEXT_PUBLIC_INFERENCE_API_URL` in Vercel
+3. Pre-warm before demos: `curl https://username-spacename.hf.space/warmup`
 
-**Oracle Cloud Always Free:** VM.Standard.A1.Flex (4 cores, 24 GB RAM, free forever). Install Docker, clone repo, `docker build -t aieng-api . && docker run -d -p 8000:8000 --restart=always aieng-api`.
+**Modal setup (GPU, live camera):**
+```bash
+pip install modal && modal setup
+modal volume create aieng-weights
+modal volume put aieng-weights weights/ /
+modal deploy inference/modal_deploy.py
+# Copy the printed URL → set as NEXT_PUBLIC_INFERENCE_API_URL in Vercel
+```
 
 ---
 
@@ -224,8 +214,8 @@ CPU-only. Live camera is too slow (~800 ms–2 s/frame). Suitable for image uplo
 
 | Service | Reason |
 |---|---|
-| Vercel full-stack (Python) | 250 MB bundle limit; 60 s function timeout; no model cache between requests |
-| Render / Koyeb / Fly.io free | 256–512 MB RAM — not enough to load YOLO11m (needs ~2 GB) |
+| Vercel full-stack (Python) | 250 MB bundle limit (YOLO deps alone exceed this); 60 s timeout kills video jobs |
+| Render / Koyeb / Fly.io free | 256–512 MB RAM — cannot load YOLO11m (needs ~2 GB) |
 
 ---
 
