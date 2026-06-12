@@ -158,23 +158,24 @@ Env var:         NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host
 
 ### Backend options (pick one)
 
-**Option A — Oracle Cloud Always Free** (recommended)  
-4 ARM cores · 24 GB RAM · never sleeps · ~400–600 ms/image.
+**Live camera requires GPU. CPU-only services will stutter.**
+
+**Option A — Modal.com** ✅ recommended (GPU, free credits)
 ```bash
-# On the Oracle VM (VM.Standard.A1.Flex, 4 OCPU, 24 GB RAM):
-git clone https://github.com/PsychicFireSong/AIEngGroupProj.git && cd AIEngGroupProj
-git lfs pull
-docker build -t aieng-api . && docker run -d -p 8000:8000 --restart=always \
-  -e AIENG_MODEL_ROOTS=/app/weights aieng-api
+pip install modal && modal setup
+modal volume create aieng-weights
+modal volume put aieng-weights weights/ /
+modal deploy inference/modal_deploy.py
+# Pre-warm before demo: curl https://<your-modal-url>/warmup
 ```
-Open port 8000 in Oracle VCN Security List. See README for full steps.
 
-**Option B — Hugging Face Spaces** (free, sleeps after 48 h idle)  
-1. Create Space → Docker SDK → connect GitHub repo
-2. Set secret: `AIENG_MODEL_ROOTS=/app/weights`
-3. Pre-warm before demos: `curl https://username-spacename.hf.space/warmup`
+**Option B — Local backend** (in-lab demo, RTX 3070 Ti)
+```powershell
+python -m uvicorn inference.api:app --host 0.0.0.0 --port 8000 --reload
+```
 
-**Option C — Railway** (~$5/month, always-on, zero setup friction)
+**Option C — HF Spaces / Oracle Cloud** (CPU only — image/video upload, no live camera)  
+See README for full setup steps.
 
 ---
 
