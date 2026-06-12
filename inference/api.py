@@ -69,10 +69,14 @@ _PER_CLASS_CONF_OVERRIDE: dict[str, float] = {
 
 # Import TTA+WBF engine (provides ~+37pp corrosion recall, +11pp crack recall vs baseline)
 try:
-    from inference_tta_wbf import run_tta_wbf as _run_tta_wbf
+    from inference.api_tta_wbf import run_tta_wbf as _run_tta_wbf
     _TTA_AVAILABLE = True
 except ImportError:
-    _TTA_AVAILABLE = False
+    try:
+        from api_tta_wbf import run_tta_wbf as _run_tta_wbf  # fallback for legacy layout
+        _TTA_AVAILABLE = True
+    except ImportError:
+        _TTA_AVAILABLE = False
 
 MAX_URL_BYTES = int(os.environ.get("AIENG_MAX_URL_BYTES", 250 * 1024 * 1024))
 DEFAULT_VIDEO_SCAN_FPS = float(os.environ.get("AIENG_VIDEO_SCAN_FPS", "1.0"))
@@ -93,6 +97,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _warmup_models() -> None:
+    """Pre-load models at startup so the first real request is fast.
+    Runs in the background to avoid blocking the health check."""
+    def _load():
+        try:
+            paths = _discover_model_paths()
+            for p in paths:
+                _load_model(str(p))
+        except Exception:
+            pass
+    threading.Thread(target=_load, daemon=True).start()
 
 
 class VideoJobCancelled(Exception):
@@ -1227,6 +1245,21 @@ def health() -> dict:
         "device": "cuda:0" if torch is not None and torch.cuda.is_available() else "cpu",
         "models": len(_discover_model_paths()),
     }
+
+
+@app.get("/warmup")
+def warmup() -> dict:
+    """Force model pre-loading. Call this once after a cold start to avoid
+    the first inference request paying the model-load penalty (~5-8 s on CPU)."""
+    paths = _discover_model_paths()
+    loaded = []
+    for p in paths:
+        try:
+            _load_model(str(p))
+            loaded.append(Path(p).name)
+        except Exception as exc:
+            loaded.append(f"{Path(p).name} [error: {exc}]")
+    return {"loaded": loaded, "device": "cuda:0" if torch is not None and torch.cuda.is_available() else "cpu"}
 
 
 @app.get("/api/models")
