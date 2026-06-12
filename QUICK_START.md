@@ -156,14 +156,17 @@ Build Command:   npm run build
 Env var:         NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host
 ```
 
-### Backend → Hugging Face Spaces (free)
+### Backend → Hugging Face Spaces (free, CPU-only)
 
-1. Create a Space at huggingface.co/spaces → select **Docker** SDK
-2. Push the repo (or connect GitHub)
-3. HF Spaces will build from `inference/Dockerfile`
-4. Set Space secret: `AIENG_MODEL_ROOTS=/app/weights`
+HF Spaces hosts the **backend only** — the Next.js frontend goes to Vercel.
 
-CPU-only inference is ~1–3 s/image — acceptable for a demo.
+1. Create a Space at [huggingface.co/spaces](https://huggingface.co/spaces) → SDK: **Docker**
+2. Connect this GitHub repo. HF Spaces finds the `Dockerfile` at the repo root automatically.
+3. Set Space secret → `AIENG_MODEL_ROOTS=/app/weights`
+4. Copy the Space URL and set it as the Vercel env var:
+   `NEXT_PUBLIC_INFERENCE_API_URL=https://username-spacename.hf.space`
+
+CPU inference is ~1–3 s/image — fine for a demo. Free with no time limit.
 
 ---
 

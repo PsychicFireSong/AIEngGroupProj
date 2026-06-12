@@ -168,29 +168,24 @@ npm run dev
 | Build Command | `npm run build` |
 | Environment Variable | `NEXT_PUBLIC_INFERENCE_API_URL=https://your-api-host` |
 
-### Backend — Hugging Face Spaces (free)
+### Backend — Hugging Face Spaces (free, CPU)
 
-HF Spaces Docker spaces run on CPU (2 cores, 16 GB RAM). YOLO CPU inference is ~1–3 s/image — fine for a demo.
+HF Spaces Docker spaces give 2 CPU cores and 16 GB RAM — free with no time limits. YOLO CPU inference is ~1–3 s/image, fine for a demo. **HF Spaces hosts the backend only; the Next.js frontend stays on Vercel.**
 
-1. Create a new Space → **Docker** SDK at `https://huggingface.co/spaces`
-2. Push this repo to your Space (or link the GitHub repo):
-   ```bash
-   # From inference/ — HF Spaces looks for Dockerfile here
-   # OR set Space root to repo root and point to inference/Dockerfile
-   ```
-3. Upload weights to HF Hub (avoids LFS limits in Spaces):
-   ```bash
-   pip install huggingface_hub
-   huggingface-cli upload YOUR_USERNAME/aieng-weights weights/
-   ```
-4. Set Space secrets (Settings → Variables and Secrets):
+1. Go to [huggingface.co/spaces](https://huggingface.co/spaces) → **Create new Space** → SDK: **Docker**
+2. Connect this GitHub repo (or push manually). HF Spaces picks up the `Dockerfile` at the repo root automatically.
+3. Set Space secrets (Settings → Variables and Secrets):
    ```
    AIENG_MODEL_ROOTS=/app/weights
    ```
+4. Once the Space is running, copy the public URL (e.g. `https://username-spacename.hf.space`) and set it as the Vercel env var:
+   ```
+   NEXT_PUBLIC_INFERENCE_API_URL=https://username-spacename.hf.space
+   ```
 
-The `inference/Dockerfile` already uses `requirements-inference.txt` and copies `weights/` into the image.
+The `Dockerfile` at repo root installs `requirements-inference.txt`, copies `inference/` and `weights/`, and starts uvicorn on port 7860.
 
-> **Alternative free options:** Render (free tier, 512 MB RAM — may be tight for YOLO), Koyeb (free tier, 512 MB). HF Spaces is recommended for ML models.
+> **Alternative free backends:** Render and Koyeb both have free tiers but only 512 MB RAM — tight for YOLO model loading. HF Spaces (16 GB) is the recommended free option for ML workloads.
 
 ---
 
